@@ -1,0 +1,33 @@
+# Build output
+/out/
+/out-*/
+/build-output/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Runtime state
+better_rgb.cfg
+rgb_engine_log.txt
+*.log
+*.csv
+
+# Local tools and IDE state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Secrets and signing material
+*.key
+*.pem
+*.pfx
+*.p12
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

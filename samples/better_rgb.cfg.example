@@ -1,0 +1,17 @@
+# 示例配置。实际文件由程序在 EXE 同目录生成；下列值不含用户数据。
+mode=1
+brightness=70
+targetFps=60
+autoPowerProfiles=1
+acMode=1
+acBrightness=80
+acFps=60
+batteryMode=0
+batteryBrightness=35
+batteryFps=30
+idleTimeoutMinutes=10
+powerTransitionMode=1
+transitionDurationMs=800
+touchbarMode=0
+acTouchbarMode=2
+batteryTouchbarMode=1

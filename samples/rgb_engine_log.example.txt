@@ -1,0 +1,6 @@
+[12:00:00.000] [thread 1000] enum: found VID=048D PID=600B usage_page=0xFF03 usage=0x0001 iface=1 path=<REDACTED_HID_PATH>
+[12:00:00.001] [thread 1000] enum: selected VID=048D PID=600B usage_page=0xFF03 iface=1
+[12:00:00.020] [thread 1000] device lock: EXCLUSIVE - no other process can open the RGB interface
+[12:00:00.100] [thread 1000] start_mode: switching to mode 1
+[12:00:00.110] [thread 1000] start_mode: full EC re-init (prep1+prep2) result=ok
+[12:00:00.120] [thread 2000] Fn hotkey WMI: listening for scan codes 0xB1 and 0xB2
