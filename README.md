@@ -61,7 +61,7 @@ Fn+Space 当前未适配，请在程序界面中切换灯效。
 ```powershell
 $env:LLVM_MINGW_BIN = "C:\path\to\llvm-mingw\bin"
 PowerShell -ExecutionPolicy Bypass -File .\build\build.ps1
-PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.4.5.exe"
+PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.6.0.exe"
 ```
 
 构建脚本会重新编译第一方源码、资源和随仓库提供的 hidapi Windows 后端，不复用旧对象文件。完整环境见 [`docs/BUILD_ENVIRONMENT_ZH.md`](docs/BUILD_ENVIRONMENT_ZH.md)。

@@ -1,5 +1,5 @@
 // Game Garaj (Tongfang/ITE8291) Better_RGB
-// Chinese Enhanced Version 3.4.5
+// Chinese Enhanced Version 3.6.0
 
 #define UNICODE
 #define _UNICODE
@@ -200,6 +200,8 @@ static const GUID GUID_DEVINTERFACE_HID_LOCAL =
 #define IDC_SLIDER_TRANSITION_DURATION 536
 #define IDC_EDIT_AC_TOUCHBAR_FPS_MAX 537
 #define IDC_EDIT_BAT_TOUCHBAR_FPS_MAX 538
+#define IDC_BTN_WHITE_CALIBRATE 539
+#define IDC_BTN_WHITE_RESET 540
 #define IDC_AC_TOUCHBAR_COLOR_START 630
 #define IDC_AC_TOUCHBAR_COLOR_END 631
 #define IDC_BAT_TOUCHBAR_COLOR_START 632
@@ -266,6 +268,12 @@ static volatile LONG g_mainRevealActive = 0;
 static volatile LONGLONG g_mainRevealStartTick = 0;
 
 static volatile LONG g_brightness = 100;
+/* 光谱白色校准：增益以千分比保存，校准期间最终帧强制输出未经修正的纯白。 */
+static volatile LONG g_whiteGainR = 1000;
+static volatile LONG g_whiteGainG = 1000;
+static volatile LONG g_whiteGainB = 1000;
+static volatile LONG g_whiteCalibrationActive = 0;
+static COLORREF g_observedWhiteColor = RGB(255,255,255);
 static volatile LONG g_targetFps = TARGET_FPS_DEFAULT;
 static volatile LONG g_effectiveFps = TARGET_FPS_DEFAULT;
 static volatile LONG g_slowFrameCount = 0;
@@ -420,6 +428,8 @@ static int g_trayRetries = 0;
 #define IDC_TRAY_EXIT    901
 
 static HWND g_hStatus, g_hComboMode, g_hSliderBright, g_hSliderFps, g_hLblFps, g_hLblAngle, g_hLblConcurrent;
+static HWND g_btnWhiteCalibrate, g_btnWhiteReset, g_hWhiteCalibrationSwatch;
+static HWND g_hLblWhiteCalibration;
 static HWND g_hMainWindow;
 static HANDLE g_hotkeyThread = NULL;
 static volatile LONG g_hotkeyStop = 0;
@@ -563,6 +573,10 @@ void save_config(void) {
     }
     fprintf(f, "mode=%ld\n", (long)g_activeMode);
     fprintf(f, "brightness=%ld\n", (long)g_brightness);
+    fprintf(f, "whiteObservedColor=%ld\n", (long)g_observedWhiteColor);
+    fprintf(f, "whiteGainR=%ld\n", (long)g_whiteGainR);
+    fprintf(f, "whiteGainG=%ld\n", (long)g_whiteGainG);
+    fprintf(f, "whiteGainB=%ld\n", (long)g_whiteGainB);
     fprintf(f, "targetFps=%ld\n", (long)g_targetFps);
     fprintf(f, "breathColor=%ld\n", (long)g_breathColor);
     fprintf(f, "breathSpeed=%ld\n", (long)g_breathSpeed);
@@ -779,6 +793,10 @@ void load_config(void) {
     while (fscanf(f, " %63[^=]=%ld", key, &v) == 2) {
         if (!strcmp(key, "mode")) g_cfgMode = cfg_clamp(v, -1, MODE_COUNT - 1);
         else if (!strcmp(key, "brightness")) g_brightness = cfg_clamp(v, 0, 100);
+        else if (!strcmp(key, "whiteObservedColor")) g_observedWhiteColor = (COLORREF)v;
+        else if (!strcmp(key, "whiteGainR")) g_whiteGainR = cfg_clamp(v, 50, 1000);
+        else if (!strcmp(key, "whiteGainG")) g_whiteGainG = cfg_clamp(v, 50, 1000);
+        else if (!strcmp(key, "whiteGainB")) g_whiteGainB = cfg_clamp(v, 50, 1000);
         else if (!strcmp(key, "targetFps")) g_targetFps = cfg_clamp(v, TARGET_FPS_MIN, TARGET_FPS_MAX);
         else if (!strcmp(key, "breathColor")) g_breathColor = (COLORREF)v;
         else if (!strcmp(key, "breathSpeed")) g_breathSpeed = cfg_clamp(v, 1, 40);
@@ -1459,21 +1477,65 @@ static int idle_timeout_reached(void) {
     return (DWORD)(GetTickCount() - info.dwTime) >= (DWORD)minutes * 60U * 1000U;
 }
 
+static void apply_white_gains_at(unsigned char *buf, int offset,
+                                 LONG gainR, LONG gainG, LONG gainB,
+                                 unsigned char *visited) {
+    if (offset < 0 || offset + 2 >= BUF_SIZE || visited[offset]) return;
+    visited[offset] = 1;
+    buf[offset] = (unsigned char)(((int)buf[offset] * (int)gainR + 500) / 1000);
+    buf[offset + 1] = (unsigned char)(((int)buf[offset + 1] * (int)gainG + 500) / 1000);
+    buf[offset + 2] = (unsigned char)(((int)buf[offset + 2] * (int)gainB + 500) / 1000);
+}
+
 /*
- * 全局唯一的帧出口：依次完成效果合成、Touch Bar 覆盖、过渡蒙版、亮度缩放，
- * 然后在 g_deviceLock 内把 512 字节拆成 8 个 64 字节块提交。发送失败只请求
- * 重连，不允许灯效线程自行重开设备。
+ * 在最终 HID 帧出口统一应用三通道逆向增益。使用独立输出缓冲，保证启动、
+ * 休眠和退出过渡仍以未经校正的逻辑帧计算。
+ */
+static void apply_global_white_calibration(const unsigned char *source, unsigned char *output) {
+    memcpy(output, source, BUF_SIZE);
+    LONG gainR = cfg_clamp(InterlockedCompareExchange(&g_whiteGainR, 0, 0), 50, 1000);
+    LONG gainG = cfg_clamp(InterlockedCompareExchange(&g_whiteGainG, 0, 0), 50, 1000);
+    LONG gainB = cfg_clamp(InterlockedCompareExchange(&g_whiteGainB, 0, 0), 50, 1000);
+    if (gainR == 1000 && gainG == 1000 && gainB == 1000) return;
+
+    unsigned char visited[BUF_SIZE] = {0};
+    for (size_t i = 0; i < KEYMAP_COUNT; i++)
+        apply_white_gains_at(output, KEYMAP[i].offset, gainR, gainG, gainB, visited);
+    apply_white_gains_at(output, OFFSET_SHIFT_LEFT_AUX, gainR, gainG, gainB, visited);
+    apply_white_gains_at(output, OFFSET_ENTER_AUX, gainR, gainG, gainB, visited);
+}
+
+static void build_raw_white_calibration_frame(unsigned char *output) {
+    memset(output, 0, BUF_SIZE);
+    for (size_t i = 0; i < KEYMAP_COUNT; i++) {
+        int offset = KEYMAP[i].offset;
+        if (offset >= 0 && offset + 2 < BUF_SIZE)
+            output[offset] = output[offset + 1] = output[offset + 2] = 255;
+    }
+    output[OFFSET_SHIFT_LEFT_AUX] = output[OFFSET_SHIFT_LEFT_AUX + 1] =
+        output[OFFSET_SHIFT_LEFT_AUX + 2] = 255;
+    output[OFFSET_ENTER_AUX] = output[OFFSET_ENTER_AUX + 1] =
+        output[OFFSET_ENTER_AUX + 2] = 255;
+}
+
+/*
+ * 全局唯一的帧出口：依次完成效果合成、Touch Bar 覆盖、过渡蒙版、光谱校准与
+ * 亮度缩放，然后在 g_deviceLock 内把 512 字节拆成 8 个 64 字节块提交。
+ * 发送失败只请求重连，不允许灯效线程自行重开设备。
  */
 int send_frame(unsigned char *buf) {
     unsigned char composed[BUF_SIZE];
     unsigned char mainTransitioned[BUF_SIZE];
     unsigned char transitioned[BUF_SIZE];
     unsigned char idleTransitioned[BUF_SIZE];
+    unsigned char calibrated[BUF_SIZE];
+    unsigned char calibrationWhite[BUF_SIZE];
     unsigned char scaled[BUF_SIZE];
     int finishIdleSleep = 0;
     int forceIdleBlank = 0;
     int shuttingDown = InterlockedCompareExchange(&g_shutdownFadeStarted, 0, 0) != 0;
-    int timedOut = !shuttingDown && idle_timeout_reached();
+    int calibrating = InterlockedCompareExchange(&g_whiteCalibrationActive, 0, 0) != 0;
+    int timedOut = !shuttingDown && !calibrating && idle_timeout_reached();
     LONG transition = InterlockedCompareExchange(&g_powerTransitionMode, 0, 0);
     LONG duration = InterlockedCompareExchange(&g_transitionDurationMs, 0, 0);
     LONG idleState = InterlockedCompareExchange(&g_idleTransitionState, 0, 0);
@@ -1624,10 +1686,18 @@ int send_frame(unsigned char *buf) {
         }
     }
 
+    if (calibrating) {
+        build_raw_white_calibration_frame(calibrationWhite);
+        buf = calibrationWhite;
+    } else {
+        apply_global_white_calibration(buf, calibrated);
+        buf = calibrated;
+    }
+
     ULONGLONG tStart = GetTickCount64();
     EnterCriticalSection(&g_deviceLock);
     ULONGLONG tLocked = GetTickCount64();
-    int bright = (int)g_brightness;
+    int bright = calibrating ? 100 : (int)g_brightness;
     if (bright < 100) {
         for (int i = 0; i < BUF_SIZE; i++) scaled[i] = (unsigned char)((int)buf[i] * bright / 100);
         buf = scaled;
@@ -1718,6 +1788,30 @@ static unsigned char linear_channel_to_srgb(double value) {
     if (result < 0) result = 0;
     if (result > 255) result = 255;
     return (unsigned char)result;
+}
+
+static LONG white_gain_from_linear(double weakest, double channel) {
+    if (channel <= 0.000001) return 1000;
+    LONG gain = (LONG)(weakest / channel * 1000.0 + 0.5);
+    return cfg_clamp(gain, 50, 1000);
+}
+
+/*
+ * 用户在光谱中选择“纯白指令下肉眼看到的实际颜色”。先转到线性光空间，
+ * 再以最弱通道为基准反算三个独立增益；只衰减过强通道，避免任何通道溢出。
+ */
+static int calculate_white_calibration(COLORREF observed,
+                                       LONG *gainR, LONG *gainG, LONG *gainB) {
+    double r = srgb_channel_to_linear(GetRValue(observed));
+    double g = srgb_channel_to_linear(GetGValue(observed));
+    double b = srgb_channel_to_linear(GetBValue(observed));
+    double strongest = fmax(r, fmax(g, b));
+    double weakest = fmin(r, fmin(g, b));
+    if (strongest < 0.01 || weakest < 0.0005) return 0;
+    *gainR = white_gain_from_linear(weakest, r);
+    *gainG = white_gain_from_linear(weakest, g);
+    *gainB = white_gain_from_linear(weakest, b);
+    return 1;
 }
 
 static void sample_palette_linear(const COLORREF colors[3], double phase,
@@ -4416,6 +4510,87 @@ void set_swatch_color(HWND hwnd, COLORREF col) {
     InvalidateRect(hwnd, NULL, TRUE);
 }
 
+static void update_white_calibration_ui(void) {
+    if (g_hWhiteCalibrationSwatch)
+        set_swatch_color(g_hWhiteCalibrationSwatch, g_observedWhiteColor);
+    if (!g_hLblWhiteCalibration) return;
+    wchar_t text[180];
+    wsprintf(text,
+        L"实测 #%02X%02X%02X　校正增益 R %ld%% / G %ld%% / B %ld%%",
+        GetRValue(g_observedWhiteColor), GetGValue(g_observedWhiteColor),
+        GetBValue(g_observedWhiteColor),
+        g_whiteGainR / 10, g_whiteGainG / 10, g_whiteGainB / 10);
+    SetWindowText(g_hLblWhiteCalibration, text);
+}
+
+static int choose_observed_white_color(HWND hwnd, COLORREF initial, COLORREF *selected) {
+    static COLORREF calibrationCustom[16] = {0};
+    CHOOSECOLOR cc = {0};
+    cc.lStructSize = sizeof(cc);
+    cc.hwndOwner = hwnd;
+    cc.rgbResult = initial;
+    cc.lpCustColors = calibrationCustom;
+    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColor(&cc)) return 0;
+    *selected = cc.rgbResult;
+    return 1;
+}
+
+static void run_white_spectrum_calibration(HWND hwnd) {
+    InterlockedExchange(&g_idleTransitionState, IDLE_TRANSITION_ACTIVE);
+    InterlockedExchange64(&g_idleTransitionStartTick, 0);
+    InterlockedExchange(&g_idleLightsOff, 0);
+    InterlockedExchange(&g_whiteCalibrationActive, 1);
+    Sleep(150);
+    MessageBox(hwnd,
+        L"键盘现在显示未经校正的纯白。\n\n"
+        L"下一步请在完整光谱中选择你肉眼看到的键盘实际颜色，"
+        L"不要选择你希望得到的白色。",
+        L"白色光谱校准", MB_OK | MB_ICONINFORMATION);
+
+    COLORREF observed = g_observedWhiteColor;
+    int accepted = choose_observed_white_color(hwnd, observed, &observed);
+    InterlockedExchange(&g_whiteCalibrationActive, 0);
+    InterlockedExchange(&g_pacerResetRequested, 1);
+    if (!accepted) {
+        log_event("white calibration: cancelled by user");
+        return;
+    }
+
+    LONG gainR, gainG, gainB;
+    if (!calculate_white_calibration(observed, &gainR, &gainG, &gainB)) {
+        MessageBox(hwnd,
+            L"所选颜色过暗或某个通道接近为零，无法稳定计算白平衡。\n"
+            L"请重新校准，并在光谱中选择更接近实际灯光亮度的颜色。",
+            L"无法完成校准", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    g_observedWhiteColor = observed;
+    InterlockedExchange(&g_whiteGainR, gainR);
+    InterlockedExchange(&g_whiteGainG, gainG);
+    InterlockedExchange(&g_whiteGainB, gainB);
+    update_white_calibration_ui();
+    save_config();
+    char logText[180];
+    sprintf(logText,
+        "white calibration: observed=#%02X%02X%02X gains=R%ld G%ld B%ld",
+        GetRValue(observed), GetGValue(observed), GetBValue(observed),
+        gainR, gainG, gainB);
+    log_event(logText);
+}
+
+static void reset_white_spectrum_calibration(void) {
+    InterlockedExchange(&g_whiteCalibrationActive, 0);
+    InterlockedExchange(&g_whiteGainR, 1000);
+    InterlockedExchange(&g_whiteGainG, 1000);
+    InterlockedExchange(&g_whiteGainB, 1000);
+    g_observedWhiteColor = RGB(255,255,255);
+    update_white_calibration_ui();
+    save_config();
+    log_event("white calibration: reset to neutral gains");
+}
+
 COLORREF pick_color(HWND hwnd, COLORREF initial) {
     static COLORREF custom[16] = {0};
     CHOOSECOLOR cc = {0};
@@ -4927,10 +5102,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 mk_label(hwnd, L"0.2 - 3.0 秒", 620, 330, 90, 20));
             add_page_control(g_pageProgram, &g_pageProgramCount,
                 mk_label(hwnd, L"只显示所选类型的细节；退出、停止和休眠会自动沿同一路径逆放。",
-                    30, 375, 660, 35));
+                    30, 365, 660, 30));
+            g_btnWhiteCalibrate = mk_button(hwnd, L"开始白色光谱校准",
+                IDC_BTN_WHITE_CALIBRATE, 30, 397, 250, 34);
+            add_page_control(g_pageProgram, &g_pageProgramCount, g_btnWhiteCalibrate);
+            g_btnWhiteReset = mk_button(hwnd, L"重置校准",
+                IDC_BTN_WHITE_RESET, 295, 397, 135, 34);
+            add_page_control(g_pageProgram, &g_pageProgramCount, g_btnWhiteReset);
+            g_hWhiteCalibrationSwatch = CreateWindow(L"SwatchClass", L"",
+                WS_CHILD|WS_BORDER, 445, 397, 50, 34, hwnd,
+                (HMENU)(INT_PTR)996, NULL, NULL);
+            add_page_control(g_pageProgram, &g_pageProgramCount, g_hWhiteCalibrationSwatch);
+            g_hLblWhiteCalibration = mk_label(hwnd, L"", 30, 438, 660, 24);
+            add_page_control(g_pageProgram, &g_pageProgramCount, g_hLblWhiteCalibration);
+            update_white_calibration_ui();
             add_page_control(g_pageProgram, &g_pageProgramCount,
                 mk_label(hwnd, L"安全策略：始终独占 RGB 接口；不会刷写 BIOS、EC 或键盘固件。",
-                    30, 425, 660, 35));
+                    30, 470, 660, 28));
 
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
                 mk_label(hwnd, L"顶行信息 Bar（独立于主灯效）", 30, 65, 660, 24));
@@ -5396,6 +5584,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             switch (LOWORD(wp)) {
+                case IDC_BTN_WHITE_CALIBRATE:
+                    run_white_spectrum_calibration(hwnd);
+                    return 0;
+                case IDC_BTN_WHITE_RESET:
+                    reset_white_spectrum_calibration();
+                    return 0;
                 case IDC_BTN_AUTOSTART: {
                     int exists = autostart_task_exists();
                     if (is_elevated()) {
@@ -5781,7 +5975,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         return 1;
     }
 
-    HWND hwnd = CreateWindow(wc.lpszClassName, L"同模具 ITE8291 - Better RGB 中文增强版 3.4.5",
+    HWND hwnd = CreateWindow(wc.lpszClassName, L"同模具 ITE8291 - Better RGB 中文增强版 3.6.0",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 540,
         NULL, NULL, hInst, NULL);
