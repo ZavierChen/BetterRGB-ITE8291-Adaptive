@@ -4,7 +4,7 @@
 
 项目通过用户态 HID 实时输出逐键灯光帧，在不修改 BIOS、EC 固件或系统驱动的前提下，改善原厂动态灯效卡顿，并提供更完整的灯效、电源和过渡控制。
 
-> 当前源码与应用版本：**3.6.0**。本版新增三通道白色光谱校准，可根据键盘实际显示的白色自动计算 R/G/B 校正增益。GitHub Releases 中现有的最新预编译公开包仍为 v3.4.5；需要 3.6.0 时请从 `main` 分支按下文构建，或等待新的 Release 包。
+> 当前源码与应用版本：**3.6.1**。本版修复默认播放设备变化后音量 Bar 临时覆盖失效的问题，并包含 3.6.0 的三通道白色光谱校准。GitHub Releases 中现有的最新预编译公开包仍为 v3.4.5；需要 3.6.1 时请从 `main` 分支按下文构建，或等待新的 Release 包。
 
 > 当前实机验证：机械革命苍龙 16 X Pro，`VID_048D&PID_600B`，Usage Page `0xFF03`，MI_01。其他同模具机型请先核对硬件 ID 和键位映射。
 
@@ -12,6 +12,7 @@
 
 - 16 种逐键灯效，包括呼吸、波浪、星光、响应、色轮、闪电、火焰、雨滴、矩阵、静态、涟漪、彩虹、流沙、电流、触控电流和同步辨色。
 - 3.6.0 白色光谱校准：输出未经校正的满亮度纯白，根据肉眼观察到的实际颜色在线性光空间反算 R/G/B 独立增益，并支持持久化与一键重置。
+- 3.6.1 音量 Bar 修复：默认播放设备切换后自动重新绑定音量监测，调节音量仍会临时显示音量并在 1.8 秒后恢复原指标。
 - 插电与电池使用两套独立模式、亮度、发送上限和 Touch Bar 配置。
 - 启动、关闭、停止、空白恢复和定时休眠过渡，支持渐亮、方向涟漪与双蛇形漩涡路径。
 - 无输入自动休眠，恢复操作后平滑点亮。
@@ -25,7 +26,7 @@ Fn+Space 当前未适配，请在程序界面中切换灯效。
 
 ## 下载与使用
 
-1. 从 GitHub Releases 下载 Windows x64 压缩包并解压；当前预编译公开包为 v3.4.5。需要 3.6.0 白色光谱校准时，请从 `main` 分支自行构建或等待新的 Release 包。
+1. 从 GitHub Releases 下载 Windows x64 压缩包并解压；当前预编译公开包为 v3.4.5。需要 3.6.1（含白色光谱校准和音量 Bar 修复）时，请从 `main` 分支自行构建或等待新的 Release 包。
 2. 退出原厂控制中心的灯光控制，运行 BetterRGB。
 3. 首次接管可能需要管理员权限，以释放并独占 RGB HID 接口。
 4. 若要恢复原厂灯光，正常退出 BetterRGB，并重新启动原厂控制中心或重启系统。
@@ -64,7 +65,7 @@ Fn+Space 当前未适配，请在程序界面中切换灯效。
 ```powershell
 $env:LLVM_MINGW_BIN = "C:\path\to\llvm-mingw\bin"
 PowerShell -ExecutionPolicy Bypass -File .\build\build.ps1
-PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.6.0.exe"
+PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.6.1.exe"
 ```
 
 构建脚本会重新编译第一方源码、资源和随仓库提供的 hidapi Windows 后端，不复用旧对象文件。完整环境见 [`docs/BUILD_ENVIRONMENT_ZH.md`](docs/BUILD_ENVIRONMENT_ZH.md)。

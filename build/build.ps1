@@ -35,7 +35,7 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $resourceObject = Join-Path $OutputDirectory "resource.o"
 $applicationObject = Join-Path $OutputDirectory "better_rgb.o"
 $hidObject = Join-Path $OutputDirectory "hid.o"
-$executable = Join-Path $OutputDirectory "Better RGB Adaptive v3.6.0.exe"
+$executable = Join-Path $OutputDirectory "Better RGB Adaptive v3.6.1.exe"
 
 Invoke-Checked $windres @(
     (Join-Path $source "resource.rc"), "-O", "coff", "-o", $resourceObject

@@ -1,5 +1,5 @@
 // Game Garaj (Tongfang/ITE8291) Better_RGB
-// Chinese Enhanced Version 3.6.0
+// Chinese Enhanced Version 3.6.1
 
 #define UNICODE
 #define _UNICODE
@@ -3798,6 +3798,46 @@ static void initialize_audio_metrics(IMMDeviceEnumerator **enumerator,
     }
 }
 
+static int refresh_default_render_metrics(IMMDeviceEnumerator *enumerator,
+                                          IAudioEndpointVolume **volume,
+                                          IAudioMeterInformation **renderMeter,
+                                          LPWSTR *endpointId) {
+    if (!enumerator) return 0;
+
+    IMMDevice *device = NULL;
+    if (FAILED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator,
+            eRender, eConsole, &device)) || !device) return 0;
+
+    LPWSTR currentId = NULL;
+    if (FAILED(IMMDevice_GetId(device, &currentId)) || !currentId) {
+        IMMDevice_Release(device);
+        return 0;
+    }
+
+    int changed = !*endpointId || lstrcmpW(*endpointId, currentId) != 0;
+    if (changed) {
+        IAudioEndpointVolume *newVolume = NULL;
+        IAudioMeterInformation *newRenderMeter = NULL;
+        IMMDevice_Activate(device, &IID_IAudioEndpointVolume_Local,
+            CLSCTX_ALL, NULL, (void **)&newVolume);
+        IMMDevice_Activate(device, &IID_IAudioMeterInformation_Local,
+            CLSCTX_ALL, NULL, (void **)&newRenderMeter);
+
+        if (*volume) IAudioEndpointVolume_Release(*volume);
+        if (*renderMeter) (*renderMeter)->lpVtbl->Release(*renderMeter);
+        if (*endpointId) CoTaskMemFree(*endpointId);
+        *volume = newVolume;
+        *renderMeter = newRenderMeter;
+        *endpointId = currentId;
+        log_event("touchbar metrics: default render endpoint rebound");
+    } else {
+        CoTaskMemFree(currentId);
+    }
+
+    IMMDevice_Release(device);
+    return changed;
+}
+
 DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
     (void)p;
     HRESULT comResult = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -3806,6 +3846,7 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
     IAudioEndpointVolume *volume = NULL;
     IAudioMeterInformation *renderMeter = NULL;
     IAudioMeterInformation *captureMeter = NULL;
+    LPWSTR renderEndpointId = NULL;
     initialize_audio_metrics(&enumerator, &volume, &renderMeter, &captureMeter);
 
     PDH_HQUERY gpuQuery = NULL;
@@ -3825,7 +3866,9 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
     BOOL lastMute = FALSE;
     int volumeInitialized = 0;
     ULONGLONG nextSystemSample = 0, nextAudioRetry = 0, nextVolumeSample = 0;
+    ULONGLONG nextEndpointCheck = 0;
     ULONGLONG volumeOverrideUntil = 0;
+    int volumeOverrideActive = 0;
     LONG lastMode = TOUCHBAR_OFF;
     log_event("touchbar metrics: worker started");
 
@@ -3844,6 +3887,14 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
             initialize_audio_metrics(&enumerator, &volume, &renderMeter, &captureMeter);
             nextAudioRetry = now + 5000;
         }
+        if (now >= nextEndpointCheck) {
+            if (refresh_default_render_metrics(enumerator, &volume, &renderMeter,
+                    &renderEndpointId)) {
+                volumeInitialized = 0;
+                nextVolumeSample = 0;
+            }
+            nextEndpointCheck = now + 1000;
+        }
         if (volume && now >= nextVolumeSample) {
             float value = 0.0f;
             BOOL mute = FALSE;
@@ -3855,6 +3906,9 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
                     (fabs((double)displayed - (double)lastVolume) >= 0.004 ||
                      mute != lastMute)) {
                     volumeOverrideUntil = now + 1800;
+                    if (!volumeOverrideActive)
+                        log_event("touchbar metrics: volume override started");
+                    volumeOverrideActive = 1;
                 }
                 cachedVolume = displayed;
                 lastVolume = displayed;
@@ -3867,6 +3921,11 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
                 nextAudioRetry = 0;
             }
             nextVolumeSample = now + 50;
+        }
+
+        if (volumeOverrideActive && now >= volumeOverrideUntil) {
+            volumeOverrideActive = 0;
+            log_event("touchbar metrics: volume override ended");
         }
 
         LONG mode = now < volumeOverrideUntil ? TOUCHBAR_VOLUME : configuredMode;
@@ -3929,6 +3988,7 @@ DWORD WINAPI touchbar_metrics_thread(LPVOID p) {
     if (captureMeter) captureMeter->lpVtbl->Release(captureMeter);
     if (renderMeter) renderMeter->lpVtbl->Release(renderMeter);
     if (volume) IAudioEndpointVolume_Release(volume);
+    if (renderEndpointId) CoTaskMemFree(renderEndpointId);
     if (enumerator) IMMDeviceEnumerator_Release(enumerator);
     InterlockedExchange(&g_touchbarDisplayMode, TOUCHBAR_OFF);
     if (uninitialize) CoUninitialize();
@@ -5975,7 +6035,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         return 1;
     }
 
-    HWND hwnd = CreateWindow(wc.lpszClassName, L"同模具 ITE8291 - Better RGB 中文增强版 3.6.0",
+    HWND hwnd = CreateWindow(wc.lpszClassName, L"同模具 ITE8291 - Better RGB 中文增强版 3.6.1",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 540,
         NULL, NULL, hInst, NULL);
