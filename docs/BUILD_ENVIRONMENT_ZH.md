@@ -12,7 +12,7 @@
 ```powershell
 $env:LLVM_MINGW_BIN = "C:\path\to\llvm-mingw\bin"
 PowerShell -ExecutionPolicy Bypass -File .\build\build.ps1
-PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.4.5.exe"
+PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.6.0.exe"
 ```
 
 也可将工具链目录直接传给脚本：
