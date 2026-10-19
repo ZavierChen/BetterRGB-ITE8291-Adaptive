@@ -2,6 +2,14 @@
 
 本记录根据历史安装包说明、EXE 版本资源、回滚目录、各版手册、配置字段差异、运行日志及 GitHub Release 交叉恢复。早期版本未全部建立 Git 标签，因此以下内容记录可验证的功能演进；标为“实验性构建”的功能不代表进入过最终公开版本。
 
+## v3.7.0 — 中英文界面与上游链接更新
+
+- 增加“Language / 语言”选项，在中文与英文之间即时切换并保存；首次启动按系统界面语言选择默认值。
+- 覆盖所有五个页面、灯效参数、状态、托盘菜单、校准提示、自启反馈和错误信息；新增英文 README。
+- 按上游作者 Issue #5 更新 README、NOTICE、中文手册和本日志中的上游链接，并保留已归档旧仓库作为历史参考。
+- 将翻译目录与语言处理拆为 `i18n.c` / `ui_strings.def`，将线性光转换与白色校准拆为 `color_math.c`；其余主程序逐步整理，未宣称完成全部模块化。
+- 增加无需键盘硬件的界面、配置、翻译覆盖和颜色计算回归测试。
+
 ## v3.6.1 — 音量 Bar 自动切换修复
 
 - 修复指标线程只在启动时绑定一次默认播放设备的问题；开机音频初始化、驱动重载或播放设备切换后不再停留在旧端点。
@@ -153,5 +161,5 @@
 
 ## 上游基线
 
-- 项目早期基础来自 EpicYamo / TheYamo 的 `Better-RGB-for-Tongfang_ITE8291`，依据 MIT License 延续。
+- 项目早期基础来自 EpicYamo / TheYamo 的 [Better RGB for Tongfang/ITE8291](https://github.com/EpicYamo/Better-RGB-for-Tongfang-ITE8291)，依据 MIT License 延续。上游开发现已迁移到此模块化新仓库；[旧仓库](https://github.com/EpicYamo/Better_RGB_Old-Repo)已归档，仅作历史参考。
 - 保留 ITE8291 用户态 HID 帧控制框架；后续增强始终限定在 Windows 用户态，不刷写 BIOS、EC、键盘固件或驱动。

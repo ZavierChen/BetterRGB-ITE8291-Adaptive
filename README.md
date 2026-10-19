@@ -1,10 +1,12 @@
 # BetterRGB ITE8291 Adaptive
 
+[English](README_EN.md) | 简体中文
+
 面向同模具游戏本的独立 Windows RGB 键盘控制器，适用于采用兼容 ITE8291 HID 接口的单键 RGB 键盘。
 
 项目通过用户态 HID 实时输出逐键灯光帧，在不修改 BIOS、EC 固件或系统驱动的前提下，改善原厂动态灯效卡顿，并提供更完整的灯效、电源和过渡控制。
 
-> 当前源码、应用与预编译公开版本：**3.6.1**。本版修复默认播放设备变化后音量 Bar 临时覆盖失效的问题，并包含 3.6.0 的三通道白色光谱校准。
+> 当前版本：**3.7.0**。新增中英文即时切换和英文使用说明，更新上游仓库链接，并开始拆分语言与颜色计算模块；包含 3.6.1 音量 Bar 修复与三通道白色光谱校准。
 
 > 当前实机验证：机械革命苍龙 16 X Pro，`VID_048D&PID_600B`，Usage Page `0xFF03`，MI_01。其他同模具机型请先核对硬件 ID 和键位映射。
 
@@ -20,13 +22,13 @@
 - 电量、音量、麦克风、CPU、GPU 和音频可视化条，调节音量时自动临时显示音量。
 - 独占 RGB HID 接口，阻止原厂灯光服务周期性覆盖当前灯效。
 - 断线重连、慢帧降速、托盘运行、配置持久化与计划任务自启。
-- 简体中文 Win32 原生界面，不依赖第三方 UI 框架。
+- 中英文 Win32 原生界面：在“程序设置 / Settings”中通过“Language / 语言”即时切换并保存。首次启动按 Windows 界面语言默认选择中文或英文，不依赖第三方 UI 框架。
 
 Fn+Space 当前未适配，请在程序界面中切换灯效。
 
 ## 下载与使用
 
-1. 从 GitHub Releases 下载 `BetterRGB_Adaptive_v3.6.1_Windows_x64.zip` 并完整解压。
+1. 从 [GitHub Releases](https://github.com/ZavierChen/BetterRGB-ITE8291-Adaptive/releases/latest) 下载 `BetterRGB_Adaptive_v3.7.0_Windows_x64.zip` 并完整解压。
 2. 退出原厂控制中心的灯光控制，运行 BetterRGB。
 3. 首次接管可能需要管理员权限，以释放并独占 RGB HID 接口。
 4. 若要恢复原厂灯光，正常退出 BetterRGB，并重新启动原厂控制中心或重启系统。
@@ -65,7 +67,7 @@ Fn+Space 当前未适配，请在程序界面中切换灯效。
 ```powershell
 $env:LLVM_MINGW_BIN = "C:\path\to\llvm-mingw\bin"
 PowerShell -ExecutionPolicy Bypass -File .\build\build.ps1
-PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.6.1.exe"
+PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable ".\out\Better RGB Adaptive v3.7.0.exe"
 ```
 
 构建脚本会重新编译第一方源码、资源和随仓库提供的 hidapi Windows 后端，不复用旧对象文件。完整环境见 [`docs/BUILD_ENVIRONMENT_ZH.md`](docs/BUILD_ENVIRONMENT_ZH.md)。
@@ -84,7 +86,9 @@ PowerShell -ExecutionPolicy Bypass -File .\build\verify_binary.ps1 -Executable "
 
 ## 开源致谢
 
-项目早期协议与实现基于 TheYamo 的开源项目 [Better RGB for Tongfang/ITE8291](https://github.com/EpicYamo/Better-RGB-for-Tongfang_ITE8291)，此后经过多个版本的独立硬件适配、灯效引擎、中文 UI、电源策略、过渡系统、指标显示、快捷键和稳定性重构。感谢原作者公开基础研究成果。
+项目早期协议与实现基于 TheYamo（EpicYamo）的开源项目 [Better RGB for Tongfang/ITE8291](https://github.com/EpicYamo/Better-RGB-for-Tongfang-ITE8291)，此后经过多个版本的独立硬件适配、灯效引擎、UI、电源策略、过渡系统、指标显示、快捷键和稳定性重构。感谢原作者公开基础研究成果，以及在 [Issue #5](https://github.com/ZavierChen/BetterRGB-ITE8291-Adaptive/issues/5) 中对英文支持和模块化提出的建议。
+
+上游现已采用模块化代码、CMake 和 GitHub Actions；后续上游开发请访问上述新仓库。[旧仓库](https://github.com/EpicYamo/Better_RGB_Old-Repo)已归档，仅作历史参考。
 
 hidapi 由其原项目维护者提供，本仓库保留 BSD 3-Clause 与原始许可证文本。
 

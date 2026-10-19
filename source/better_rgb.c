@@ -1,5 +1,5 @@
 // Game Garaj (Tongfang/ITE8291) Better_RGB
-// Chinese Enhanced Version 3.6.1
+// Chinese Enhanced Version 3.7.0
 
 #define UNICODE
 #define _UNICODE
@@ -25,10 +25,12 @@
 #include <stdlib.h>
 #include "hidapi.h"
 #include "resource.h"
+#include "i18n.h"
+#include "color_math.h"
 
 /*
- * 维护导读：本程序把 UI、灯效生成、系统指标和 HID 传输放在一个 Win32 C
- * 文件中。所有灯效先生成统一的 512 字节逻辑帧，再由 send_frame() 叠加
+ * 维护导读：语言目录位于 i18n.c/ui_strings.def，颜色计算位于 color_math.c。
+ * 本文件协调 UI、灯效、系统指标和 HID。灯效生成 512 字节帧，由 send_frame() 叠加
  * Touch Bar、启动/休眠/关机过渡与亮度，最后串行提交到 ITE RGB HID 接口。
  * 新效果不应直接调用 hidapi，以免绕过锁、重连和安全降帧逻辑。
  */
@@ -202,6 +204,7 @@ static const GUID GUID_DEVINTERFACE_HID_LOCAL =
 #define IDC_EDIT_BAT_TOUCHBAR_FPS_MAX 538
 #define IDC_BTN_WHITE_CALIBRATE 539
 #define IDC_BTN_WHITE_RESET 540
+#define IDC_COMBO_LANGUAGE 541
 #define IDC_AC_TOUCHBAR_COLOR_START 630
 #define IDC_AC_TOUCHBAR_COLOR_END 631
 #define IDC_BAT_TOUCHBAR_COLOR_START 632
@@ -572,6 +575,7 @@ void save_config(void) {
         return;
     }
     fprintf(f, "mode=%ld\n", (long)g_activeMode);
+    fprintf(f, "uiLanguage=%d\n", ui_language_get());
     fprintf(f, "brightness=%ld\n", (long)g_brightness);
     fprintf(f, "whiteObservedColor=%ld\n", (long)g_observedWhiteColor);
     fprintf(f, "whiteGainR=%ld\n", (long)g_whiteGainR);
@@ -792,6 +796,7 @@ void load_config(void) {
     int sawTouchbarProfile = 0;
     while (fscanf(f, " %63[^=]=%ld", key, &v) == 2) {
         if (!strcmp(key, "mode")) g_cfgMode = cfg_clamp(v, -1, MODE_COUNT - 1);
+        else if (!strcmp(key, "uiLanguage")) ui_language_set((int)v);
         else if (!strcmp(key, "brightness")) g_brightness = cfg_clamp(v, 0, 100);
         else if (!strcmp(key, "whiteObservedColor")) g_observedWhiteColor = (COLORREF)v;
         else if (!strcmp(key, "whiteGainR")) g_whiteGainR = cfg_clamp(v, 50, 1000);
@@ -1314,13 +1319,13 @@ static void autostart_apply(int install) {
     int r = install ? autostart_install() : autostart_remove();
     const wchar_t *msg;
     if (r == 0 && install)
-        msg = L"开机自动启动已开启。\n"
-              L"每次登录 Windows 时，程序都会以管理员权限自动启动，不再显示 UAC 提示。";
+        msg = ui_text(L"开机自动启动已开启。\n"
+              L"每次登录 Windows 时，程序都会以管理员权限自动启动，不再显示 UAC 提示。");
     else if (r == 0)
-        msg = L"开机自动启动已关闭。";
+        msg = ui_text(L"开机自动启动已关闭。");
     else
-        msg = L"操作失败，请重试。";
-    MessageBoxW(NULL, msg, L"Better RGB 中文增强版", MB_OK | (r == 0 ? MB_ICONINFORMATION : MB_ICONERROR));
+        msg = ui_text(L"操作失败，请重试。");
+    MessageBoxW(NULL, msg, ui_text(L"Better RGB 中文增强版"), MB_OK | (r == 0 ? MB_ICONINFORMATION : MB_ICONERROR));
 }
 
 static int relaunch_elevated(const wchar_t *args, int waitForExit) {
@@ -1343,8 +1348,8 @@ static int relaunch_elevated(const wchar_t *args, int waitForExit) {
 static void update_autostart_button(void) {
     if (!g_btnAutostart) return;
     SetWindowTextW(g_btnAutostart, autostart_task_exists()
-        ? L"开机自动启动：已开启"
-        : L"开机自动启动：已关闭");
+        ? ui_text(L"开机自动启动：已开启")
+        : ui_text(L"开机自动启动：已关闭"));
     InvalidateRect(g_btnAutostart, NULL, TRUE);
 }
 
@@ -1775,44 +1780,6 @@ static double smooth_unit(double value) {
     return value * value * (3.0 - 2.0 * value);
 }
 
-static double srgb_channel_to_linear(unsigned char value) {
-    double c = (double)value / 255.0;
-    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-
-static unsigned char linear_channel_to_srgb(double value) {
-    if (value <= 0.0) return 0;
-    if (value >= 1.0) return 255;
-    double c = value <= 0.0031308 ? value * 12.92 : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
-    int result = (int)(c * 255.0 + 0.5);
-    if (result < 0) result = 0;
-    if (result > 255) result = 255;
-    return (unsigned char)result;
-}
-
-static LONG white_gain_from_linear(double weakest, double channel) {
-    if (channel <= 0.000001) return 1000;
-    LONG gain = (LONG)(weakest / channel * 1000.0 + 0.5);
-    return cfg_clamp(gain, 50, 1000);
-}
-
-/*
- * 用户在光谱中选择“纯白指令下肉眼看到的实际颜色”。先转到线性光空间，
- * 再以最弱通道为基准反算三个独立增益；只衰减过强通道，避免任何通道溢出。
- */
-static int calculate_white_calibration(COLORREF observed,
-                                       LONG *gainR, LONG *gainG, LONG *gainB) {
-    double r = srgb_channel_to_linear(GetRValue(observed));
-    double g = srgb_channel_to_linear(GetGValue(observed));
-    double b = srgb_channel_to_linear(GetBValue(observed));
-    double strongest = fmax(r, fmax(g, b));
-    double weakest = fmin(r, fmin(g, b));
-    if (strongest < 0.01 || weakest < 0.0005) return 0;
-    *gainR = white_gain_from_linear(weakest, r);
-    *gainG = white_gain_from_linear(weakest, g);
-    *gainB = white_gain_from_linear(weakest, b);
-    return 1;
-}
 
 static void sample_palette_linear(const COLORREF colors[3], double phase,
                                   double *r, double *g, double *b) {
@@ -4021,7 +3988,7 @@ static void apply_fn_brightness(ULONG scanCode) {
     save_config();
 
     wchar_t status[96];
-    wsprintf(status, L"快捷键：键盘亮度 %ld%%", next);
+    wsprintf(status, ui_text(L"快捷键：键盘亮度 %ld%%"), next);
     set_status(status);
     char logText[96];
     sprintf(logText, "Fn hotkey: brightness changed from %ld to %ld",
@@ -4032,7 +3999,7 @@ static void apply_fn_brightness(ULONG scanCode) {
 static void update_fps_label(void) {
     if (!g_hLblFps) return;
     wchar_t text[96];
-    wsprintf(text, L"RGB 帧率：调度 %ld / 目标 %ld FPS",
+    wsprintf(text, ui_text(L"RGB 帧率：调度 %ld / 目标 %ld FPS"),
         InterlockedCompareExchange(&g_effectiveFps, 0, 0),
         InterlockedCompareExchange(&g_targetFps, 0, 0));
     SetWindowText(g_hLblFps, text);
@@ -4189,50 +4156,50 @@ LPTHREAD_START_ROUTINE mode_to_fn(int mode) {
 
 const wchar_t* mode_to_label(int mode) {
     switch (mode) {
-        case MODE_BREATH: return L"当前模式：呼吸";
-        case MODE_WAVE: return L"当前模式：波浪";
-        case MODE_SPARKLE: return L"当前模式：星光";
-        case MODE_REACTIVE: return L"当前模式：按键响应";
-        case MODE_WHEEL: return L"当前模式：色轮";
-        case MODE_LIGHTNING: return L"当前模式：闪电";
-        case MODE_FLAME: return L"当前模式：火焰";
-        case MODE_RAIN: return L"当前模式：雨滴";
-        case MODE_MATRIX: return L"当前模式：矩阵";
-        case MODE_STATIC: return L"当前模式：静态";
-        case MODE_RIPPLE: return L"当前模式：触碰涟漪";
-        case MODE_RAINBOW: return L"当前模式：全彩渐变";
-        case MODE_QUICKSAND: return L"当前模式：流沙";
-        case MODE_CURRENT: return L"当前模式：电流";
-        case MODE_TOUCH_CURRENT: return L"当前模式：触控电流";
-        case MODE_SCREEN_AMBIENT: return L"当前模式：同步辨色";
+        case MODE_BREATH: return ui_text(L"当前模式：呼吸");
+        case MODE_WAVE: return ui_text(L"当前模式：波浪");
+        case MODE_SPARKLE: return ui_text(L"当前模式：星光");
+        case MODE_REACTIVE: return ui_text(L"当前模式：按键响应");
+        case MODE_WHEEL: return ui_text(L"当前模式：色轮");
+        case MODE_LIGHTNING: return ui_text(L"当前模式：闪电");
+        case MODE_FLAME: return ui_text(L"当前模式：火焰");
+        case MODE_RAIN: return ui_text(L"当前模式：雨滴");
+        case MODE_MATRIX: return ui_text(L"当前模式：矩阵");
+        case MODE_STATIC: return ui_text(L"当前模式：静态");
+        case MODE_RIPPLE: return ui_text(L"当前模式：触碰涟漪");
+        case MODE_RAINBOW: return ui_text(L"当前模式：全彩渐变");
+        case MODE_QUICKSAND: return ui_text(L"当前模式：流沙");
+        case MODE_CURRENT: return ui_text(L"当前模式：电流");
+        case MODE_TOUCH_CURRENT: return ui_text(L"当前模式：触控电流");
+        case MODE_SCREEN_AMBIENT: return ui_text(L"当前模式：同步辨色");
     }
-    return L"当前模式：无";
+    return ui_text(L"当前模式：无");
 }
 
 static const wchar_t* mode_to_name(int mode) {
     switch (mode) {
-        case MODE_BREATH: return L"呼吸";
-        case MODE_WAVE: return L"波浪";
-        case MODE_SPARKLE: return L"星光";
-        case MODE_REACTIVE: return L"按键响应";
-        case MODE_WHEEL: return L"色轮";
-        case MODE_LIGHTNING: return L"闪电";
-        case MODE_FLAME: return L"火焰";
-        case MODE_RAIN: return L"雨滴";
-        case MODE_MATRIX: return L"矩阵";
-        case MODE_STATIC: return L"静态";
-        case MODE_RIPPLE: return L"触碰涟漪";
-        case MODE_RAINBOW: return L"全彩渐变";
-        case MODE_QUICKSAND: return L"流沙";
-        case MODE_CURRENT: return L"电流";
-        case MODE_TOUCH_CURRENT: return L"触控电流";
-        case MODE_SCREEN_AMBIENT: return L"同步辨色";
+        case MODE_BREATH: return ui_text(L"呼吸");
+        case MODE_WAVE: return ui_text(L"波浪");
+        case MODE_SPARKLE: return ui_text(L"星光");
+        case MODE_REACTIVE: return ui_text(L"按键响应");
+        case MODE_WHEEL: return ui_text(L"色轮");
+        case MODE_LIGHTNING: return ui_text(L"闪电");
+        case MODE_FLAME: return ui_text(L"火焰");
+        case MODE_RAIN: return ui_text(L"雨滴");
+        case MODE_MATRIX: return ui_text(L"矩阵");
+        case MODE_STATIC: return ui_text(L"静态");
+        case MODE_RIPPLE: return ui_text(L"触碰涟漪");
+        case MODE_RAINBOW: return ui_text(L"全彩渐变");
+        case MODE_QUICKSAND: return ui_text(L"流沙");
+        case MODE_CURRENT: return ui_text(L"电流");
+        case MODE_TOUCH_CURRENT: return ui_text(L"触控电流");
+        case MODE_SCREEN_AMBIENT: return ui_text(L"同步辨色");
     }
-    return L"关闭";
+    return ui_text(L"关闭");
 }
 
 static void populate_mode_combo(HWND combo, int includeOff) {
-    if (includeOff) SendMessage(combo, CB_ADDSTRING, 0, (LPARAM)L"关闭灯光");
+    if (includeOff) SendMessage(combo, CB_ADDSTRING, 0, (LPARAM)ui_text(L"关闭灯光"));
     for (int mode=0; mode<MODE_COUNT; mode++)
         SendMessage(combo, CB_ADDSTRING, 0, (LPARAM)mode_to_name(mode));
 }
@@ -4333,7 +4300,7 @@ static void update_transition_duration_label(void) {
     if (!g_hLblTransitionDuration) return;
     LONG duration = InterlockedCompareExchange(&g_transitionDurationMs, 0, 0);
     wchar_t text[64];
-    wsprintf(text, L"过渡时长：%ld.%01ld 秒", duration / 1000, (duration % 1000) / 100);
+    wsprintf(text, ui_text(L"过渡时长：%ld.%01ld 秒"), duration / 1000, (duration % 1000) / 100);
     SetWindowText(g_hLblTransitionDuration, text);
 }
 
@@ -4348,18 +4315,18 @@ static void update_transition_detail_ui(void) {
 
     if (family == 2) {
         const wchar_t *labels[] = {
-            L"中心：J / K 向外", L"四周边缘向内", L"上到下",
-            L"下到上", L"左到右", L"右到左"
+            ui_text(L"中心：J / K 向外"), ui_text(L"四周边缘向内"), ui_text(L"上到下"),
+            ui_text(L"下到上"), ui_text(L"左到右"), ui_text(L"右到左")
         };
-        SetWindowText(g_hLblTransitionDetail, L"涟漪方向：");
+        SetWindowText(g_hLblTransitionDetail, ui_text(L"涟漪方向："));
         for (int i = 0; i < 6; i++)
             SendMessage(g_hComboTransitionDetail, CB_ADDSTRING, 0, (LPARAM)labels[i]);
     } else if (family == 3) {
         const wchar_t *labels[] = {
-            L"主对角双蛇：外向内", L"主对角双蛇：内向外",
-            L"副对角双蛇：外向内", L"副对角双蛇：内向外"
+            ui_text(L"主对角双蛇：外向内"), ui_text(L"主对角双蛇：内向外"),
+            ui_text(L"副对角双蛇：外向内"), ui_text(L"副对角双蛇：内向外")
         };
-        SetWindowText(g_hLblTransitionDetail, L"螺旋路径：");
+        SetWindowText(g_hLblTransitionDetail, ui_text(L"螺旋路径："));
         for (int i = 0; i < 4; i++)
             SendMessage(g_hComboTransitionDetail, CB_ADDSTRING, 0, (LPARAM)labels[i]);
     }
@@ -4372,12 +4339,12 @@ static void update_transition_detail_ui(void) {
 
 static const wchar_t *touchbar_mode_hint(LONG mode) {
     if (mode == TOUCHBAR_OFF)
-        return L"当前已关闭，不显示额外参数。";
+        return ui_text(L"当前已关闭，不显示额外参数。");
     if (mode == TOUCHBAR_AUDIO)
-        return L"音频波形只使用下方三色 RGB。调音量时会短暂切换为音量。";
+        return ui_text(L"音频波形只使用下方三色 RGB。调音量时会短暂切换为音量。");
     if (mode == TOUCHBAR_FPS)
-        return L"仅在此模式启动 FrameView SDK，按前台应用统计真实帧率；范围 15-500。\n调音量时会短暂切换为音量。";
-    return L"颜色 A/B 表示数值从低到高的渐变，调音量时会临时显示音量。";
+        return ui_text(L"仅在此模式启动 FrameView SDK，按前台应用统计真实帧率；范围 15-500。\n调音量时会短暂切换为音量。");
+    return ui_text(L"颜色 A/B 表示数值从低到高的渐变，调音量时会临时显示音量。");
 }
 
 /* Touch Bar 同理按“关闭/指标/音频”类型动态显示所需参数。 */
@@ -4456,16 +4423,16 @@ static void update_power_profile_ui(void) {
     if (g_hSliderBatteryBright) SendMessage(g_hSliderBatteryBright, TBM_SETPOS, TRUE, g_batteryBrightness);
     if (g_hSliderBatteryFps) SendMessage(g_hSliderBatteryFps, TBM_SETPOS, TRUE, g_batteryFps);
     if (g_hLblAcFps) {
-        wchar_t text[64]; wsprintf(text, L"帧率：%ld", g_acFps); SetWindowText(g_hLblAcFps, text);
+        wchar_t text[64]; wsprintf(text, ui_text(L"帧率：%ld"), g_acFps); SetWindowText(g_hLblAcFps, text);
     }
     if (g_hLblBatteryFps) {
-        wchar_t text[64]; wsprintf(text, L"帧率：%ld", g_batteryFps); SetWindowText(g_hLblBatteryFps, text);
+        wchar_t text[64]; wsprintf(text, ui_text(L"帧率：%ld"), g_batteryFps); SetWindowText(g_hLblBatteryFps, text);
     }
     if (g_hPowerStatus) {
         wchar_t text[160];
-        wsprintf(text, L"当前电源：%ls　自动切换：%ls",
-            g_onAcPower ? L"已插电" : L"使用电池",
-            g_autoPowerProfiles ? L"开启" : L"关闭");
+        wsprintf(text, ui_text(L"当前电源：%ls　自动切换：%ls"),
+            g_onAcPower ? ui_text(L"已插电") : ui_text(L"使用电池"),
+            g_autoPowerProfiles ? ui_text(L"开启") : ui_text(L"关闭"));
         SetWindowText(g_hPowerStatus, text);
     }
     if (g_hAutoPowerCheck)
@@ -4536,7 +4503,7 @@ static void apply_power_profile(int onAc, int force) {
     } else {
         stop_current_effect();
         capture_current_power_profile();
-        set_status(L"当前模式：无");
+        set_status(ui_text(L"当前模式：无"));
         save_config();
     }
 }
@@ -4576,7 +4543,7 @@ static void update_white_calibration_ui(void) {
     if (!g_hLblWhiteCalibration) return;
     wchar_t text[180];
     wsprintf(text,
-        L"实测 #%02X%02X%02X　校正增益 R %ld%% / G %ld%% / B %ld%%",
+        ui_text(L"实测 #%02X%02X%02X　校正增益 R %ld%% / G %ld%% / B %ld%%"),
         GetRValue(g_observedWhiteColor), GetGValue(g_observedWhiteColor),
         GetBValue(g_observedWhiteColor),
         g_whiteGainR / 10, g_whiteGainG / 10, g_whiteGainB / 10);
@@ -4603,10 +4570,10 @@ static void run_white_spectrum_calibration(HWND hwnd) {
     InterlockedExchange(&g_whiteCalibrationActive, 1);
     Sleep(150);
     MessageBox(hwnd,
-        L"键盘现在显示未经校正的纯白。\n\n"
+        ui_text(L"键盘现在显示未经校正的纯白。\n\n"
         L"下一步请在完整光谱中选择你肉眼看到的键盘实际颜色，"
-        L"不要选择你希望得到的白色。",
-        L"白色光谱校准", MB_OK | MB_ICONINFORMATION);
+        L"不要选择你希望得到的白色。"),
+        ui_text(L"白色光谱校准"), MB_OK | MB_ICONINFORMATION);
 
     COLORREF observed = g_observedWhiteColor;
     int accepted = choose_observed_white_color(hwnd, observed, &observed);
@@ -4620,9 +4587,9 @@ static void run_white_spectrum_calibration(HWND hwnd) {
     LONG gainR, gainG, gainB;
     if (!calculate_white_calibration(observed, &gainR, &gainG, &gainB)) {
         MessageBox(hwnd,
-            L"所选颜色过暗或某个通道接近为零，无法稳定计算白平衡。\n"
-            L"请重新校准，并在光谱中选择更接近实际灯光亮度的颜色。",
-            L"无法完成校准", MB_OK | MB_ICONWARNING);
+            ui_text(L"所选颜色过暗或某个通道接近为零，无法稳定计算白平衡。\n"
+            L"请重新校准，并在光谱中选择更接近实际灯光亮度的颜色。"),
+            ui_text(L"无法完成校准"), MB_OK | MB_ICONWARNING);
         return;
     }
 
@@ -4799,7 +4766,7 @@ void refresh_static_ui(void) {
     SendMessage(g_hComboStaticZoneSel, CB_RESETCONTENT, 0, 0);
     for (int i=0;i<zc;i++) {
         wchar_t buf[16];
-        wsprintf(buf, L"颜色 %d", i+1);
+        wsprintf(buf, ui_text(L"颜色 %d"), i+1);
         SendMessage(g_hComboStaticZoneSel, CB_ADDSTRING, 0, (LPARAM)buf);
     }
     if (g_staticActiveZone >= zc) g_staticActiveZone = 0;
@@ -4811,6 +4778,55 @@ void refresh_static_ui(void) {
     InvalidateRect(g_btnStaticVert, NULL, TRUE);
     HWND top = GetAncestor(g_btnStaticColor, GA_ROOT);
     if (top) { InvalidateRect(top, NULL, TRUE); UpdateWindow(top); }
+}
+
+/* Relabel controls without recreating them or changing their selection/state. */
+static BOOL CALLBACK translate_control(HWND control, LPARAM unused) {
+    (void)unused;
+    if (GetDlgCtrlID(control) == IDC_COMBO_LANGUAGE) return TRUE;
+    wchar_t className[32], text[1024];
+    GetClassNameW(control, className, 32);
+    if (lstrcmpiW(className, L"COMBOBOX") == 0) {
+        LRESULT selected = SendMessageW(control, CB_GETCURSEL, 0, 0);
+        LRESULT count = SendMessageW(control, CB_GETCOUNT, 0, 0);
+        for (LRESULT i = 0; i < count; ++i) {
+            LRESULT length = SendMessageW(control, CB_GETLBTEXTLEN, (WPARAM)i, 0);
+            if (length < 0 || length >= 1024) continue;
+            SendMessageW(control, CB_GETLBTEXT, (WPARAM)i, (LPARAM)text);
+            const wchar_t *translated = ui_text(text);
+            if (wcscmp(text, translated) != 0) {
+                SendMessageW(control, CB_DELETESTRING, (WPARAM)i, 0);
+                SendMessageW(control, CB_INSERTSTRING, (WPARAM)i, (LPARAM)translated);
+            }
+        }
+        SendMessageW(control, CB_SETCURSEL, (WPARAM)selected, 0);
+    } else {
+        GetWindowTextW(control, text, 1024);
+        const wchar_t *translated = ui_text(text);
+        if (wcscmp(text, translated) != 0) SetWindowTextW(control, translated);
+    }
+    return TRUE;
+}
+
+static void refresh_ui_language(HWND hwnd) {
+    EnumChildWindows(hwnd, translate_control, 0);
+    SendDlgItemMessageW(hwnd, IDC_COMBO_LANGUAGE, CB_SETCURSEL, ui_language_get(), 0);
+    SetWindowTextW(hwnd, ui_text(L"同模具 ITE8291 - Better RGB 中文增强版 3.7.0"));
+    wcscpy(g_nid.szTip, ui_text(L"Better RGB 中文增强版"));
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    update_autostart_button();
+    update_power_profile_ui();
+    update_fps_label();
+    update_transition_detail_ui();
+    update_white_calibration_ui();
+    refresh_static_ui();
+    set_status(mode_to_label((int)g_activeMode));
+    wchar_t text[96];
+    wsprintfW(text, ui_text(L"角度：%d 度"), (int)g_waveAngle);
+    SetWindowTextW(g_hLblAngle, text);
+    wsprintfW(text, ui_text(L"同时出现数量：%d"), (int)g_lightningConcurrent);
+    SetWindowTextW(g_hLblConcurrent, text);
+    InvalidateRect(hwnd, NULL, TRUE);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -4841,7 +4857,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             g_nid.uCallbackMessage = WM_TRAYICON;
             g_nid.hIcon = hAppIcon;
-            wcscpy(g_nid.szTip, L"Better RGB 中文增强版");
+            wcscpy(g_nid.szTip, ui_text(L"Better RGB 中文增强版"));
             g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
             ChangeWindowMessageFilterEx(hwnd, g_msgTaskbarCreated, MSGFLT_ALLOW, NULL);
             g_msgShowInstance = RegisterWindowMessageW(L"BetterRGB_TheYamo_Show");
@@ -4856,95 +4872,95 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
 
-            const wchar_t *tabNames[] = {L"灯效", L"插电方案", L"电池方案", L"顶行 Bar", L"程序设置"};
+            const wchar_t *tabNames[] = {ui_text(L"灯效"), ui_text(L"插电方案"), ui_text(L"电池方案"), ui_text(L"顶行 Bar"), ui_text(L"程序设置")};
             for (int i = 0; i < 5; i++)
                 g_hPageButton[i] = mk_button(hwnd, tabNames[i], IDC_PAGE_EFFECTS+i,
                     20+i*140, 14, 132, 34);
 
             add_page_control(g_pageEffects, &g_pageEffectsCount,
-                mk_label(hwnd, L"选择灯效：", 20, 66, 100, 20));
+                mk_label(hwnd, ui_text(L"选择灯效："), 20, 66, 100, 20));
             g_hComboMode = CreateWindow(L"COMBOBOX", L"", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
                 120, 63, 240, 260, hwnd, (HMENU)IDC_COMBO_MODE, NULL, NULL);
             add_page_control(g_pageEffects, &g_pageEffectsCount, g_hComboMode);
             populate_mode_combo(g_hComboMode, 0);
 
             add_page_control(g_pageEffects, &g_pageEffectsCount,
-                mk_button(hwnd, L"停止主灯效（顶行信息可继续）", IDC_BTN_STOP, 390, 62, 310, 35));
+                mk_button(hwnd, ui_text(L"停止主灯效（顶行信息可继续）"), IDC_BTN_STOP, 390, 62, 310, 35));
 
-            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, L"呼吸颜色：", 20, 105, 150, 20);
+            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, ui_text(L"呼吸颜色："), 20, 105, 150, 20);
             g_hSwatchBreath = CreateWindow(L"SwatchClass", L"", WS_CHILD|WS_BORDER, 20,128,50,28, hwnd, (HMENU)(INT_PTR)999, NULL, NULL);
             g_panelBreath[g_panelBreathCount++] = g_hSwatchBreath;
-            g_panelBreath[g_panelBreathCount++] = mk_button(hwnd, L"选择颜色", IDC_BTN_COLOR_BREATH, 80, 128, 120, 28);
-            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, L"速度：", 20, 165, 150, 20);
+            g_panelBreath[g_panelBreathCount++] = mk_button(hwnd, ui_text(L"选择颜色"), IDC_BTN_COLOR_BREATH, 80, 128, 120, 28);
+            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, ui_text(L"速度："), 20, 165, 150, 20);
             g_panelBreath[g_panelBreathCount++] = mk_slider(hwnd, IDC_SLIDER_BSPEED, 20, 185, 340, 30, 1, 40, g_breathSpeed);
-            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, L"平滑度：", 20, 220, 150, 20);
+            g_panelBreath[g_panelBreathCount++] = mk_label(hwnd, ui_text(L"平滑度："), 20, 220, 150, 20);
             g_panelBreath[g_panelBreathCount++] = mk_slider(hwnd, IDC_SLIDER_BSMOOTH, 20, 240, 340, 30, 2, 150, g_breathSmooth);
-            HWND breathRandom = CreateWindow(L"BUTTON", L"随机多色（每次呼吸换色）", WS_CHILD|BS_AUTOCHECKBOX,
+            HWND breathRandom = CreateWindow(L"BUTTON", ui_text(L"随机多色（每次呼吸换色）"), WS_CHILD|BS_AUTOCHECKBOX,
                 20, 280, 300, 24, hwnd, (HMENU)IDC_CHK_BREATH_RANDOM, NULL, NULL);
             g_panelBreath[g_panelBreathCount++] = breathRandom;
             CheckDlgButton(hwnd, IDC_CHK_BREATH_RANDOM, g_breathRandomMode ? BST_CHECKED : BST_UNCHECKED);
 
-            g_hLblAngle = mk_label(hwnd, L"角度：0 度", 20, 105, 300, 20);
+            g_hLblAngle = mk_label(hwnd, ui_text(L"角度：0 度"), 20, 105, 300, 20);
             g_panelWave[g_panelWaveCount++] = g_hLblAngle;
             HWND sAngle = mk_slider(hwnd, IDC_SLIDER_ANGLE, 20, 125, 340, 30, 0, 359, g_waveAngle);
             SendMessage(sAngle, TBM_SETTICFREQ, 45, 0);
             SetWindowLongPtr(sAngle, GWL_STYLE, GetWindowLongPtr(sAngle, GWL_STYLE) | TBS_TOOLTIPS);
             SendMessage(sAngle, TBM_SETTIPSIDE, TBTS_TOP, 0);
             g_panelWave[g_panelWaveCount++] = sAngle;
-            g_panelWave[g_panelWaveCount++] = mk_label(hwnd, L"速度：", 20, 165, 150, 20);
+            g_panelWave[g_panelWaveCount++] = mk_label(hwnd, ui_text(L"速度："), 20, 165, 150, 20);
             g_panelWave[g_panelWaveCount++] = mk_slider(hwnd, IDC_SLIDER_WSPEED, 20, 185, 340, 30, 1, 20, g_waveSpeed);
 
-            g_panelSparkle[g_panelSparkleCount++] = mk_label(hwnd, L"速度：", 20, 105, 150, 20);
+            g_panelSparkle[g_panelSparkleCount++] = mk_label(hwnd, ui_text(L"速度："), 20, 105, 150, 20);
             g_panelSparkle[g_panelSparkleCount++] = mk_slider(hwnd, IDC_SLIDER_SPSPEED, 20, 125, 340, 30, 1, 10, g_sparkleSpeed);
-            g_panelSparkle[g_panelSparkleCount++] = mk_label(hwnd, L"密度：", 20, 165, 150, 20);
+            g_panelSparkle[g_panelSparkleCount++] = mk_label(hwnd, ui_text(L"密度："), 20, 165, 150, 20);
             g_panelSparkle[g_panelSparkleCount++] = mk_slider(hwnd, IDC_SLIDER_SPDENS, 20, 185, 340, 30, 3, 20, g_sparkleDensity);
 
-            g_panelReactive[g_panelReactiveCount++] = mk_label(hwnd, L"响应颜色：", 20, 105, 200, 20);
+            g_panelReactive[g_panelReactiveCount++] = mk_label(hwnd, ui_text(L"响应颜色："), 20, 105, 200, 20);
             g_hSwatchReact = CreateWindow(L"SwatchClass", L"", WS_CHILD|WS_BORDER, 20,128,50,28, hwnd, (HMENU)(INT_PTR)998, NULL, NULL);
             g_panelReactive[g_panelReactiveCount++] = g_hSwatchReact;
-            g_panelReactive[g_panelReactiveCount++] = mk_button(hwnd, L"选择颜色", IDC_BTN_COLOR_REACT, 80, 128, 120, 28);
-            g_panelReactive[g_panelReactiveCount++] = mk_button(hwnd, L"随机", IDC_BTN_REACT_RANDOM, 210, 128, 90, 28);
-            g_panelReactive[g_panelReactiveCount++] = mk_label(hwnd, L"持续时间：", 20, 168, 150, 20);
-            HWND rShort = CreateWindow(L"BUTTON", L"短", WS_CHILD|BS_AUTORADIOBUTTON|WS_GROUP,
+            g_panelReactive[g_panelReactiveCount++] = mk_button(hwnd, ui_text(L"选择颜色"), IDC_BTN_COLOR_REACT, 80, 128, 120, 28);
+            g_panelReactive[g_panelReactiveCount++] = mk_button(hwnd, ui_text(L"随机"), IDC_BTN_REACT_RANDOM, 210, 128, 90, 28);
+            g_panelReactive[g_panelReactiveCount++] = mk_label(hwnd, ui_text(L"持续时间："), 20, 168, 150, 20);
+            HWND rShort = CreateWindow(L"BUTTON", ui_text(L"短"), WS_CHILD|BS_AUTORADIOBUTTON|WS_GROUP,
                 20, 190, 100, 24, hwnd, (HMENU)IDC_RADIO_SHORT, NULL, NULL);
-            HWND rMedium = CreateWindow(L"BUTTON", L"中", WS_CHILD|BS_AUTORADIOBUTTON,
+            HWND rMedium = CreateWindow(L"BUTTON", ui_text(L"中"), WS_CHILD|BS_AUTORADIOBUTTON,
                 130, 190, 100, 24, hwnd, (HMENU)IDC_RADIO_MEDIUM, NULL, NULL);
-            HWND rLong = CreateWindow(L"BUTTON", L"长", WS_CHILD|BS_AUTORADIOBUTTON,
+            HWND rLong = CreateWindow(L"BUTTON", ui_text(L"长"), WS_CHILD|BS_AUTORADIOBUTTON,
                 240, 190, 100, 24, hwnd, (HMENU)IDC_RADIO_LONG, NULL, NULL);
             SendMessage(rMedium, BM_SETCHECK, BST_CHECKED, 0);
             g_panelReactive[g_panelReactiveCount++] = rShort;
             g_panelReactive[g_panelReactiveCount++] = rMedium;
             g_panelReactive[g_panelReactiveCount++] = rLong;
 
-            HWND chkRev = CreateWindow(L"BUTTON", L"反向旋转", WS_CHILD|BS_AUTOCHECKBOX,
+            HWND chkRev = CreateWindow(L"BUTTON", ui_text(L"反向旋转"), WS_CHILD|BS_AUTOCHECKBOX,
                 20, 105, 200, 20, hwnd, (HMENU)IDC_CHK_WHEEL_REVERSE, NULL, NULL);
             g_panelWheel[g_panelWheelCount++] = chkRev;
-            g_panelWheel[g_panelWheelCount++] = mk_label(hwnd, L"速度：", 20, 135, 150, 20);
+            g_panelWheel[g_panelWheelCount++] = mk_label(hwnd, ui_text(L"速度："), 20, 135, 150, 20);
             g_panelWheel[g_panelWheelCount++] = mk_slider(hwnd, IDC_SLIDER_WHSPEED, 20, 155, 340, 30, 1, 20, g_wheelSpeed);
 
-            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, L"速度：", 20, 105, 200, 20);
+            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, ui_text(L"速度："), 20, 105, 200, 20);
             g_panelLightning[g_panelLightningCount++] = mk_slider(hwnd, IDC_SLIDER_LTSPEED, 20, 125, 340, 30, 1, 10, g_lightningSpeed);
-            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, L"平滑度：", 20, 165, 200, 20);
+            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, ui_text(L"平滑度："), 20, 165, 200, 20);
             g_panelLightning[g_panelLightningCount++] = mk_slider(hwnd, IDC_SLIDER_LTSMOOTH, 20, 185, 340, 30, 1, 20, g_lightningSmooth);
-            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, L"闪电宽度：", 20, 225, 200, 20);
+            g_panelLightning[g_panelLightningCount++] = mk_label(hwnd, ui_text(L"闪电宽度："), 20, 225, 200, 20);
             g_panelLightning[g_panelLightningCount++] = mk_slider(hwnd, IDC_SLIDER_LTWIDTH, 20, 245, 340, 30, 1, 4, g_lightningWidth);
-            g_hLblConcurrent = mk_label(hwnd, L"同时出现数量：1", 20, 285, 250, 20);
+            g_hLblConcurrent = mk_label(hwnd, ui_text(L"同时出现数量：1"), 20, 285, 250, 20);
             g_panelLightning[g_panelLightningCount++] = g_hLblConcurrent;
             g_panelLightning[g_panelLightningCount++] = mk_slider(hwnd, IDC_SLIDER_LTCONCUR, 20, 305, 340, 30, 1, 4, g_lightningConcurrent);
 
-            g_panelFlame[g_panelFlameCount++] = mk_label(hwnd, L"闪烁速度：", 20, 105, 200, 20);
+            g_panelFlame[g_panelFlameCount++] = mk_label(hwnd, ui_text(L"闪烁速度："), 20, 105, 200, 20);
             g_panelFlame[g_panelFlameCount++] = mk_slider(hwnd, IDC_SLIDER_FLSPEED, 20, 125, 340, 30, 1, 10, g_flameSpeed);
-            g_panelFlame[g_panelFlameCount++] = mk_label(hwnd, L"平滑度：", 20, 165, 200, 20);
+            g_panelFlame[g_panelFlameCount++] = mk_label(hwnd, ui_text(L"平滑度："), 20, 165, 200, 20);
             g_panelFlame[g_panelFlameCount++] = mk_slider(hwnd, IDC_SLIDER_FLSMOOTH, 20, 185, 340, 30, 1, 20, g_flameSmooth);
 
-            g_panelRain[g_panelRainCount++] = mk_label(hwnd, L"下落速度：", 20, 105, 200, 20);
+            g_panelRain[g_panelRainCount++] = mk_label(hwnd, ui_text(L"下落速度："), 20, 105, 200, 20);
             g_panelRain[g_panelRainCount++] = mk_slider(hwnd, IDC_SLIDER_RNSPEED, 20, 125, 340, 30, 1, 10, g_rainSpeed);
-            g_panelRain[g_panelRainCount++] = mk_label(hwnd, L"密度（同时出现的雨滴）：", 20, 165, 300, 20);
+            g_panelRain[g_panelRainCount++] = mk_label(hwnd, ui_text(L"密度（同时出现的雨滴）："), 20, 165, 300, 20);
             for (int c=0;c<5;c++) {
                 g_rainDensityBtn[c] = mk_button(hwnd, (const wchar_t*[]){L"1",L"2",L"3",L"4",L"5"}[c], IDC_RAIN_DENSITY_BASE+c, 20+c*68, 185, 60, 30);
                 g_panelRain[g_panelRainCount++] = g_rainDensityBtn[c];
             }
-            g_panelRain[g_panelRainCount++] = mk_label(hwnd, L"颜色数量：", 20, 225, 200, 20);
+            g_panelRain[g_panelRainCount++] = mk_label(hwnd, ui_text(L"颜色数量："), 20, 225, 200, 20);
             for (int c=0;c<5;c++) {
                 g_rainColorCountBtn[c] = mk_button(hwnd, (const wchar_t*[]){L"1",L"2",L"3",L"4",L"5"}[c], IDC_RAIN_COLORCNT_BASE+c, 20+c*68, 245, 60, 30);
                 g_panelRain[g_panelRainCount++] = g_rainColorCountBtn[c];
@@ -4954,23 +4970,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_panelRain[g_panelRainCount++] = g_rainColorBtn[c];
             }
 
-            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, L"光带速度：", 20, 105, 200, 20);
+            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, ui_text(L"光带速度："), 20, 105, 200, 20);
             g_panelMatrix[g_panelMatrixCount++] = mk_slider(hwnd, IDC_SLIDER_MXSPEED, 20, 125, 340, 30, 1, 10, g_matrixSpeed);
-            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, L"样式：", 20, 165, 200, 20);
+            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, ui_text(L"样式："), 20, 165, 200, 20);
             g_hComboMatrixStyle = CreateWindow(L"COMBOBOX", L"", WS_CHILD|CBS_DROPDOWNLIST|WS_VSCROLL,
                 20, 185, 340, 100, hwnd, (HMENU)IDC_COMBO_MXSTYLE, NULL, NULL);
-            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)L"斜向光带");
-            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)L"垂直数字雨");
-            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)L"激光扫描");
-            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)L"涟漪");
+            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)ui_text(L"斜向光带"));
+            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)ui_text(L"垂直数字雨"));
+            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)ui_text(L"激光扫描"));
+            SendMessage(g_hComboMatrixStyle, CB_ADDSTRING, 0, (LPARAM)ui_text(L"涟漪"));
             SendMessage(g_hComboMatrixStyle, CB_SETCURSEL, 0, 0);
             g_panelMatrix[g_panelMatrixCount++] = g_hComboMatrixStyle;
-            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, L"密度（斜向/激光模式）：", 20, 220, 300, 20);
+            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, ui_text(L"密度（斜向/激光模式）："), 20, 220, 300, 20);
             for (int c=0;c<5;c++) {
                 g_matrixDensityBtn[c] = mk_button(hwnd, (const wchar_t*[]){L"1",L"2",L"3",L"4",L"5"}[c], IDC_MATRIX_DENSITY_BASE+c, 20+c*68, 240, 60, 30);
                 g_panelMatrix[g_panelMatrixCount++] = g_matrixDensityBtn[c];
             }
-            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, L"颜色数量：", 20, 280, 200, 20);
+            g_panelMatrix[g_panelMatrixCount++] = mk_label(hwnd, ui_text(L"颜色数量："), 20, 280, 200, 20);
             for (int c=0;c<3;c++) {
                 g_matrixColorCountBtn[c] = mk_button(hwnd, (const wchar_t*[]){L"1",L"2",L"3"}[c], IDC_MATRIX_COLORCNT_BASE+c, 20+c*113, 300, 105, 30);
                 g_panelMatrix[g_panelMatrixCount++] = g_matrixColorCountBtn[c];
@@ -4980,82 +4996,82 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_panelMatrix[g_panelMatrixCount++] = g_matrixColorBtn[c];
             }
 
-            g_panelStatic[g_panelStaticCount++] = mk_label(hwnd, L"布局：", 20, 105, 200, 20);
-            g_btnStaticHoriz = mk_button(hwnd, L"横向分区", IDC_BTN_STATIC_HORIZ, 20, 125, 165, 32);
-            HWND btnStaticVert = mk_button(hwnd, L"纵向分区", IDC_BTN_STATIC_VERT, 195, 125, 165, 32);
+            g_panelStatic[g_panelStaticCount++] = mk_label(hwnd, ui_text(L"布局："), 20, 105, 200, 20);
+            g_btnStaticHoriz = mk_button(hwnd, ui_text(L"横向分区"), IDC_BTN_STATIC_HORIZ, 20, 125, 165, 32);
+            HWND btnStaticVert = mk_button(hwnd, ui_text(L"纵向分区"), IDC_BTN_STATIC_VERT, 195, 125, 165, 32);
             g_btnStaticVert = btnStaticVert;
             g_panelStatic[g_panelStaticCount++] = g_btnStaticHoriz;
             g_panelStatic[g_panelStaticCount++] = g_btnStaticVert;
-            g_panelStatic[g_panelStaticCount++] = mk_label(hwnd, L"分区数量：", 20, 165, 200, 20);
+            g_panelStatic[g_panelStaticCount++] = mk_label(hwnd, ui_text(L"分区数量："), 20, 165, 200, 20);
             g_hSliderStaticZones = mk_slider(hwnd, IDC_SLIDER_STATIC_ZONES, 20, 185, 340, 30, 1, 6, g_staticZoneCount);
             g_panelStatic[g_panelStaticCount++] = g_hSliderStaticZones;
             g_hComboStaticZoneSel = CreateWindow(L"COMBOBOX", L"", WS_CHILD|CBS_DROPDOWNLIST|WS_VSCROLL,
                 20, 225, 340, 150, hwnd, (HMENU)IDC_COMBO_STATIC_ZONESEL, NULL, NULL);
             g_panelStatic[g_panelStaticCount++] = g_hComboStaticZoneSel;
-            g_btnStaticColor = mk_button(hwnd, L"选择当前分区颜色", IDC_BTN_STATIC_COLOR, 20, 265, 340, 36);
+            g_btnStaticColor = mk_button(hwnd, ui_text(L"选择当前分区颜色"), IDC_BTN_STATIC_COLOR, 20, 265, 340, 36);
             g_panelStatic[g_panelStaticCount++] = g_btnStaticColor;
 
-            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, L"涟漪颜色：", 20, 105, 200, 20);
+            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, ui_text(L"涟漪颜色："), 20, 105, 200, 20);
             g_hSwatchRipple = CreateWindow(L"SwatchClass", L"", WS_CHILD|WS_BORDER, 20,128,50,28, hwnd, (HMENU)(INT_PTR)997, NULL, NULL);
             g_panelRipple[g_panelRippleCount++] = g_hSwatchRipple;
-            g_panelRipple[g_panelRippleCount++] = mk_button(hwnd, L"选择颜色", IDC_BTN_COLOR_RIPPLE, 80, 128, 120, 28);
-            g_panelRipple[g_panelRippleCount++] = mk_button(hwnd, L"随机", IDC_BTN_RIPPLE_RANDOM, 210, 128, 90, 28);
-            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, L"扩散速度：", 20, 168, 150, 20);
+            g_panelRipple[g_panelRippleCount++] = mk_button(hwnd, ui_text(L"选择颜色"), IDC_BTN_COLOR_RIPPLE, 80, 128, 120, 28);
+            g_panelRipple[g_panelRippleCount++] = mk_button(hwnd, ui_text(L"随机"), IDC_BTN_RIPPLE_RANDOM, 210, 128, 90, 28);
+            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, ui_text(L"扩散速度："), 20, 168, 150, 20);
             g_panelRipple[g_panelRippleCount++] = mk_slider(hwnd, IDC_SLIDER_RIPSPEED, 20, 188, 340, 30, 1, 10, g_rippleSpeed);
-            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, L"波纹宽度：", 20, 223, 150, 20);
+            g_panelRipple[g_panelRippleCount++] = mk_label(hwnd, ui_text(L"波纹宽度："), 20, 223, 150, 20);
             g_panelRipple[g_panelRippleCount++] = mk_slider(hwnd, IDC_SLIDER_RIPWIDTH, 20, 243, 340, 30, 1, 4, g_rippleWidth);
 
-            g_panelRainbow[g_panelRainbowCount++] = mk_label(hwnd, L"整块键盘保持常亮，RGB 颜色连续平滑循环。", 20, 105, 340, 40);
-            g_panelRainbow[g_panelRainbowCount++] = mk_label(hwnd, L"变色速度：", 20, 155, 150, 20);
+            g_panelRainbow[g_panelRainbowCount++] = mk_label(hwnd, ui_text(L"整块键盘保持常亮，RGB 颜色连续平滑循环。"), 20, 105, 340, 40);
+            g_panelRainbow[g_panelRainbowCount++] = mk_label(hwnd, ui_text(L"变色速度："), 20, 155, 150, 20);
             g_panelRainbow[g_panelRainbowCount++] = mk_slider(hwnd, IDC_SLIDER_RBWSPEED, 20, 175, 340, 30, 1, 20, g_rainbowSpeed);
 
-            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, L"渐变颜色（首尾自动闭环）：", 20, 105, 300, 20);
+            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, ui_text(L"渐变颜色（首尾自动闭环）："), 20, 105, 300, 20);
             for (int c=0; c<3; c++) {
                 g_quicksandColorBtn[c] = mk_button(hwnd, L"", IDC_QUICKSAND_COLOR_BASE+c, 20+c*113, 128, 105, 32);
                 g_panelQuicksand[g_panelQuicksandCount++] = g_quicksandColorBtn[c];
             }
-            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, L"下落速度：", 20, 170, 150, 20);
+            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, ui_text(L"下落速度："), 20, 170, 150, 20);
             g_panelQuicksand[g_panelQuicksandCount++] = mk_slider(hwnd, IDC_SLIDER_QSSPEED, 20, 190, 340, 30, 1, 10, g_quicksandSpeed);
-            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, L"沙带宽度：", 20, 225, 150, 20);
+            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, ui_text(L"沙带宽度："), 20, 225, 150, 20);
             g_panelQuicksand[g_panelQuicksandCount++] = mk_slider(hwnd, IDC_SLIDER_QSSCALE, 20, 245, 340, 30, 1, 10, g_quicksandScale);
-            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, L"连续 RGB 混色 + 每键 2×2 线性光采样", 20, 285, 340, 25);
+            g_panelQuicksand[g_panelQuicksandCount++] = mk_label(hwnd, ui_text(L"连续 RGB 混色 + 每键 2×2 线性光采样"), 20, 285, 340, 25);
 
-            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, L"渐变颜色（首尾自动闭环）：", 20, 105, 300, 20);
+            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, ui_text(L"渐变颜色（首尾自动闭环）："), 20, 105, 300, 20);
             for (int c=0; c<3; c++) {
                 g_currentColorBtn[c] = mk_button(hwnd, L"", IDC_CURRENT_COLOR_BASE+c, 20+c*113, 128, 105, 32);
                 g_panelCurrent[g_panelCurrentCount++] = g_currentColorBtn[c];
             }
-            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, L"流动速度：", 20, 170, 150, 20);
+            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, ui_text(L"流动速度："), 20, 170, 150, 20);
             g_panelCurrent[g_panelCurrentCount++] = mk_slider(hwnd, IDC_SLIDER_CURSPEED, 20, 190, 340, 30, 1, 10, g_currentSpeed);
-            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, L"电流长度：", 20, 225, 150, 20);
+            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, ui_text(L"电流长度："), 20, 225, 150, 20);
             g_panelCurrent[g_panelCurrentCount++] = mk_slider(hwnd, IDC_SLIDER_CURWIDTH, 20, 245, 340, 30, 2, 8, g_currentWidth);
-            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, L"相邻行反向流动，光头与拖尾连续衰减", 20, 285, 340, 25);
+            g_panelCurrent[g_panelCurrentCount++] = mk_label(hwnd, ui_text(L"相邻行反向流动，光头与拖尾连续衰减"), 20, 285, 340, 25);
 
-            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, L"渐变颜色（首尾自动闭环）：", 20, 105, 300, 20);
+            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, ui_text(L"渐变颜色（首尾自动闭环）："), 20, 105, 300, 20);
             for (int c=0; c<3; c++) {
                 g_touchCurrentColorBtn[c] = mk_button(hwnd, L"", IDC_TOUCH_CURRENT_COLOR_BASE+c, 20+c*113, 128, 105, 32);
                 g_panelTouchCurrent[g_panelTouchCurrentCount++] = g_touchCurrentColorBtn[c];
             }
-            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, L"扩散速度：", 20, 170, 150, 20);
+            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, ui_text(L"扩散速度："), 20, 170, 150, 20);
             g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_slider(hwnd, IDC_SLIDER_TCSPEED, 20, 190, 340, 30, 1, 10, g_touchCurrentSpeed);
-            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, L"电流宽度：", 20, 225, 150, 20);
+            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, ui_text(L"电流宽度："), 20, 225, 150, 20);
             g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_slider(hwnd, IDC_SLIDER_TCWIDTH, 20, 245, 340, 30, 1, 5, g_touchCurrentWidth);
-            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, L"按键后仅沿该物理键行向左右扩散", 20, 285, 340, 25);
+            g_panelTouchCurrent[g_panelTouchCurrentCount++] = mk_label(hwnd, ui_text(L"按键后仅沿该物理键行向左右扩散"), 20, 285, 340, 25);
 
             g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd,
-                L"把主屏幕低分辨率取样为整块键盘的模糊副屏。\n画面仅在内存中处理，不保存截图。",
+                ui_text(L"把主屏幕低分辨率取样为整块键盘的模糊副屏。\n画面仅在内存中处理，不保存截图。"),
                 20, 105, 340, 48);
-            g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd, L"空间模糊范围：", 20, 165, 200, 20);
+            g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd, ui_text(L"空间模糊范围："), 20, 165, 200, 20);
             g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_slider(hwnd,
                 IDC_SLIDER_AMBIENT_BLUR, 20, 185, 340, 30, 1, 8, g_ambientBlur);
-            g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd, L"画面响应速度：", 20, 225, 200, 20);
+            g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd, ui_text(L"画面响应速度："), 20, 225, 200, 20);
             g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_slider(hwnd,
                 IDC_SLIDER_AMBIENT_RESPONSE, 20, 245, 340, 30, 1, 10, g_ambientResponse);
             g_panelScreenAmbient[g_panelScreenAmbientCount++] = mk_label(hwnd,
-                L"线性光混色 + 空间模糊 + 时间平滑", 20, 285, 340, 25);
+                ui_text(L"线性光混色 + 空间模糊 + 时间平滑"), 20, 285, 340, 25);
 
             add_page_control(g_pageEffects, &g_pageEffectsCount,
-                mk_label(hwnd, L"当前灯效亮度：", 390, 125, 250, 20));
+                mk_label(hwnd, ui_text(L"当前灯效亮度："), 390, 125, 250, 20));
             g_hSliderBright = mk_slider(hwnd, IDC_SLIDER_BRIGHT, 390, 145, 310, 30, 0, 100, g_brightness);
             add_page_control(g_pageEffects, &g_pageEffectsCount, g_hSliderBright);
             g_hLblFps = mk_label(hwnd, L"", 390, 190, 310, 20);
@@ -5064,14 +5080,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TARGET_FPS_MIN, TARGET_FPS_MAX, g_targetFps);
             add_page_control(g_pageEffects, &g_pageEffectsCount, g_hSliderFps);
             update_fps_label();
-            g_hStatus = CreateWindow(L"STATIC", L"当前模式：无", WS_CHILD|WS_VISIBLE|SS_LEFT,
+            g_hStatus = CreateWindow(L"STATIC", ui_text(L"当前模式：无"), WS_CHILD|WS_VISIBLE|SS_LEFT,
                 390, 270, 310, 25, hwnd, (HMENU)IDC_STATIC_STATUS, NULL, NULL);
             add_page_control(g_pageEffects, &g_pageEffectsCount, g_hStatus);
             add_page_control(g_pageEffects, &g_pageEffectsCount,
-                mk_label(hwnd, L"左侧只显示当前灯效参数；电源方案、顶行信息和程序行为已拆分到独立页面。",
+                mk_label(hwnd, ui_text(L"左侧只显示当前灯效参数；电源方案、顶行信息和程序行为已拆分到独立页面。"),
                     390, 315, 310, 70));
 
-            g_hAutoPowerCheck = CreateWindow(L"BUTTON", L"按插电状态自动切换主灯效",
+            g_hAutoPowerCheck = CreateWindow(L"BUTTON", ui_text(L"按插电状态自动切换主灯效"),
                 WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
                 30, 68, 650, 24, hwnd, (HMENU)IDC_CHK_POWER_AUTO, NULL, NULL);
             add_page_control(g_pagePowerShared, &g_pagePowerSharedCount, g_hAutoPowerCheck);
@@ -5079,15 +5095,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             add_page_control(g_pagePowerShared, &g_pagePowerSharedCount, g_hPowerStatus);
 
             add_page_control(g_pageAc, &g_pageAcCount,
-                mk_label(hwnd, L"插电主灯效", 30, 145, 200, 24));
+                mk_label(hwnd, ui_text(L"插电主灯效"), 30, 145, 200, 24));
             add_page_control(g_pageAc, &g_pageAcCount,
-                mk_label(hwnd, L"灯效：", 30, 190, 90, 20));
+                mk_label(hwnd, ui_text(L"灯效："), 30, 190, 90, 20));
             g_hComboAcMode = CreateWindow(L"COMBOBOX", L"", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
                 130, 187, 300, 260, hwnd, (HMENU)IDC_COMBO_AC_MODE, NULL, NULL);
             add_page_control(g_pageAc, &g_pageAcCount, g_hComboAcMode);
             populate_mode_combo(g_hComboAcMode, 1);
             add_page_control(g_pageAc, &g_pageAcCount,
-                mk_label(hwnd, L"亮度：", 30, 240, 100, 20));
+                mk_label(hwnd, ui_text(L"亮度："), 30, 240, 100, 20));
             g_hSliderAcBright = mk_slider(hwnd, IDC_SLIDER_AC_BRIGHT, 130, 235, 300, 30, 0, 100, g_acBrightness);
             add_page_control(g_pageAc, &g_pageAcCount, g_hSliderAcBright);
             g_hLblAcFps = mk_label(hwnd, L"", 30, 295, 95, 20);
@@ -5096,18 +5112,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TARGET_FPS_MIN, TARGET_FPS_MAX, g_acFps);
             add_page_control(g_pageAc, &g_pageAcCount, g_hSliderAcFps);
             add_page_control(g_pageAc, &g_pageAcCount,
-                mk_label(hwnd, L"此页只编辑插电方案；插着电时改动会立即应用。", 30, 355, 500, 30));
+                mk_label(hwnd, ui_text(L"此页只编辑插电方案；插着电时改动会立即应用。"), 30, 355, 500, 30));
 
             add_page_control(g_pageBattery, &g_pageBatteryCount,
-                mk_label(hwnd, L"电池主灯效", 30, 145, 200, 24));
+                mk_label(hwnd, ui_text(L"电池主灯效"), 30, 145, 200, 24));
             add_page_control(g_pageBattery, &g_pageBatteryCount,
-                mk_label(hwnd, L"灯效：", 30, 190, 90, 20));
+                mk_label(hwnd, ui_text(L"灯效："), 30, 190, 90, 20));
             g_hComboBatteryMode = CreateWindow(L"COMBOBOX", L"", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
                 130, 187, 300, 260, hwnd, (HMENU)IDC_COMBO_BAT_MODE, NULL, NULL);
             add_page_control(g_pageBattery, &g_pageBatteryCount, g_hComboBatteryMode);
             populate_mode_combo(g_hComboBatteryMode, 1);
             add_page_control(g_pageBattery, &g_pageBatteryCount,
-                mk_label(hwnd, L"亮度：", 30, 240, 100, 20));
+                mk_label(hwnd, ui_text(L"亮度："), 30, 240, 100, 20));
             g_hSliderBatteryBright = mk_slider(hwnd, IDC_SLIDER_BAT_BRIGHT, 130, 235, 300, 30, 0, 100, g_batteryBrightness);
             add_page_control(g_pageBattery, &g_pageBatteryCount, g_hSliderBatteryBright);
             g_hLblBatteryFps = mk_label(hwnd, L"", 30, 295, 95, 20);
@@ -5116,36 +5132,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 TARGET_FPS_MIN, TARGET_FPS_MAX, g_batteryFps);
             add_page_control(g_pageBattery, &g_pageBatteryCount, g_hSliderBatteryFps);
             add_page_control(g_pageBattery, &g_pageBatteryCount,
-                mk_label(hwnd, L"此页只编辑电池方案；使用电池时改动会立即应用。", 30, 355, 500, 30));
+                mk_label(hwnd, ui_text(L"此页只编辑电池方案；使用电池时改动会立即应用。"), 30, 355, 500, 30));
 
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"程序设置", 30, 75, 250, 26));
+                mk_label(hwnd, ui_text(L"程序设置"), 30, 75, 250, 26));
+            add_page_control(g_pageProgram, &g_pageProgramCount,
+                mk_label(hwnd, L"Language / 语言", 390, 78, 130, 24));
+            HWND languageCombo = CreateWindowW(L"COMBOBOX", L"",
+                WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST, 530, 73, 160, 100,
+                hwnd, (HMENU)IDC_COMBO_LANGUAGE, NULL, NULL);
+            add_page_control(g_pageProgram, &g_pageProgramCount, languageCombo);
+            SendMessageW(languageCombo, CB_ADDSTRING, 0, (LPARAM)L"简体中文");
+            SendMessageW(languageCombo, CB_ADDSTRING, 0, (LPARAM)L"English");
+            SendMessageW(languageCombo, CB_SETCURSEL, ui_language_get(), 0);
             g_btnAutostart = mk_button(hwnd, L"", IDC_BTN_AUTOSTART, 30, 115, 660, 34);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_btnAutostart);
             update_autostart_button();
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"无操作熄灯：", 30, 180, 120, 20));
+                mk_label(hwnd, ui_text(L"无操作熄灯："), 30, 180, 120, 20));
             g_hComboIdle = CreateWindow(L"COMBOBOX", L"", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
                 160, 177, 240, 180, hwnd, (HMENU)IDC_COMBO_IDLE, NULL, NULL);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_hComboIdle);
-            const wchar_t *idleLabels[] = {L"关闭", L"1 分钟", L"5 分钟", L"10 分钟", L"30 分钟"};
+            const wchar_t *idleLabels[] = {ui_text(L"关闭"), ui_text(L"1 分钟"), ui_text(L"5 分钟"), ui_text(L"10 分钟"), ui_text(L"30 分钟")};
             for (int i=0; i<5; i++) SendMessage(g_hComboIdle, CB_ADDSTRING, 0, (LPARAM)idleLabels[i]);
             int idleSel = g_idleTimeoutMinutes == 1 ? 1 : g_idleTimeoutMinutes == 5 ? 2 :
                           g_idleTimeoutMinutes == 10 ? 3 : g_idleTimeoutMinutes == 30 ? 4 : 0;
             SendMessage(g_hComboIdle, CB_SETCURSEL, idleSel, 0);
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"过渡类型：", 30, 225, 120, 20));
+                mk_label(hwnd, ui_text(L"过渡类型："), 30, 225, 120, 20));
             g_hComboTransitionFamily = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
                 185, 222, 300, 180, hwnd, (HMENU)IDC_COMBO_TRANSITION_FAMILY, NULL, NULL);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_hComboTransitionFamily);
             const wchar_t *transitionFamilies[] = {
-                L"关闭过渡", L"全局渐变", L"涟漪", L"双蛇漩涡"
+                ui_text(L"关闭过渡"), ui_text(L"全局渐变"), ui_text(L"涟漪"), ui_text(L"双蛇漩涡")
             };
             for (int i = 0; i < 4; i++)
                 SendMessage(g_hComboTransitionFamily, CB_ADDSTRING, 0, (LPARAM)transitionFamilies[i]);
 
-            g_hLblTransitionDetail = mk_label(hwnd, L"过渡细节：", 30, 275, 120, 20);
+            g_hLblTransitionDetail = mk_label(hwnd, ui_text(L"过渡细节："), 30, 275, 120, 20);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_hLblTransitionDetail);
             g_hComboTransitionDetail = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
@@ -5159,14 +5184,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessage(g_hSliderTransitionDuration, TBM_SETTICFREQ, 2, 0);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_hSliderTransitionDuration);
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"0.2 - 3.0 秒", 620, 330, 90, 20));
+                mk_label(hwnd, ui_text(L"0.2 - 3.0 秒"), 620, 330, 90, 20));
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"只显示所选类型的细节；退出、停止和休眠会自动沿同一路径逆放。",
+                mk_label(hwnd, ui_text(L"只显示所选类型的细节；退出、停止和休眠会自动沿同一路径逆放。"),
                     30, 365, 660, 30));
-            g_btnWhiteCalibrate = mk_button(hwnd, L"开始白色光谱校准",
+            g_btnWhiteCalibrate = mk_button(hwnd, ui_text(L"开始白色光谱校准"),
                 IDC_BTN_WHITE_CALIBRATE, 30, 397, 250, 34);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_btnWhiteCalibrate);
-            g_btnWhiteReset = mk_button(hwnd, L"重置校准",
+            g_btnWhiteReset = mk_button(hwnd, ui_text(L"重置校准"),
                 IDC_BTN_WHITE_RESET, 295, 397, 135, 34);
             add_page_control(g_pageProgram, &g_pageProgramCount, g_btnWhiteReset);
             g_hWhiteCalibrationSwatch = CreateWindow(L"SwatchClass", L"",
@@ -5177,40 +5202,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             add_page_control(g_pageProgram, &g_pageProgramCount, g_hLblWhiteCalibration);
             update_white_calibration_ui();
             add_page_control(g_pageProgram, &g_pageProgramCount,
-                mk_label(hwnd, L"安全策略：始终独占 RGB 接口；不会刷写 BIOS、EC 或键盘固件。",
+                mk_label(hwnd, ui_text(L"安全策略：始终独占 RGB 接口；不会刷写 BIOS、EC 或键盘固件。"),
                     30, 470, 660, 28));
 
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
-                mk_label(hwnd, L"顶行信息 Bar（独立于主灯效）", 30, 65, 660, 24));
+                mk_label(hwnd, ui_text(L"顶行信息 Bar（独立于主灯效）"), 30, 65, 660, 24));
             const wchar_t *touchbarModes[] = {
-                L"关闭", L"电池电量", L"系统音量", L"麦克风输入",
-                L"CPU 占用率", L"GPU 占用率", L"播放音频波形"
+                ui_text(L"关闭"), ui_text(L"电池电量"), ui_text(L"系统音量"), ui_text(L"麦克风输入"),
+                ui_text(L"CPU 占用率"), ui_text(L"GPU 占用率"), ui_text(L"播放音频波形")
             };
             const wchar_t *touchbarDirections[] = {
-                L"从左到右", L"从右到左", L"从两边到中间", L"从中间到两边"
+                ui_text(L"从左到右"), ui_text(L"从右到左"), ui_text(L"从两边到中间"), ui_text(L"从中间到两边")
             };
 
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
-                mk_label(hwnd, L"插电 Bar", 30, 105, 200, 24));
+                mk_label(hwnd, ui_text(L"插电 Bar"), 30, 105, 200, 24));
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
-                mk_label(hwnd, L"信息：", 30, 145, 90, 20));
+                mk_label(hwnd, ui_text(L"信息："), 30, 145, 90, 20));
             g_hComboAcTouchbarMode = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
                 120, 142, 230, 210, hwnd, (HMENU)IDC_COMBO_AC_TOUCHBAR_MODE, NULL, NULL);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hComboAcTouchbarMode);
-            g_hAcTouchbarDirectionLabel = mk_label(hwnd, L"方向：", 30, 190, 90, 20);
+            g_hAcTouchbarDirectionLabel = mk_label(hwnd, ui_text(L"方向："), 30, 190, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hAcTouchbarDirectionLabel);
             g_hComboAcTouchbarDirection = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
                 120, 187, 230, 150, hwnd, (HMENU)IDC_COMBO_AC_TOUCHBAR_DIRECTION, NULL, NULL);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hComboAcTouchbarDirection);
-            g_hAcTouchbarMetricLabel = mk_label(hwnd, L"指标颜色：", 30, 235, 90, 20);
+            g_hAcTouchbarMetricLabel = mk_label(hwnd, ui_text(L"指标颜色："), 30, 235, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hAcTouchbarMetricLabel);
-            g_acTouchbarColorBtnStart = mk_button(hwnd, L"颜色 A", IDC_AC_TOUCHBAR_COLOR_START, 120, 230, 108, 30);
-            g_acTouchbarColorBtnEnd = mk_button(hwnd, L"颜色 B", IDC_AC_TOUCHBAR_COLOR_END, 242, 230, 108, 30);
+            g_acTouchbarColorBtnStart = mk_button(hwnd, ui_text(L"颜色 A"), IDC_AC_TOUCHBAR_COLOR_START, 120, 230, 108, 30);
+            g_acTouchbarColorBtnEnd = mk_button(hwnd, ui_text(L"颜色 B"), IDC_AC_TOUCHBAR_COLOR_END, 242, 230, 108, 30);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_acTouchbarColorBtnStart);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_acTouchbarColorBtnEnd);
-            g_hAcTouchbarAudioLabel = mk_label(hwnd, L"音频 RGB：", 30, 280, 90, 20);
+            g_hAcTouchbarAudioLabel = mk_label(hwnd, ui_text(L"音频 RGB："), 30, 280, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hAcTouchbarAudioLabel);
             for (int i = 0; i < 3; i++) {
                 g_acTouchbarAudioColorBtn[i] = mk_button(hwnd, (const wchar_t *[]){L"RGB 1",L"RGB 2",L"RGB 3"}[i],
@@ -5219,26 +5244,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
-                mk_label(hwnd, L"电池 Bar", 390, 105, 200, 24));
+                mk_label(hwnd, ui_text(L"电池 Bar"), 390, 105, 200, 24));
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount,
-                mk_label(hwnd, L"信息：", 390, 145, 90, 20));
+                mk_label(hwnd, ui_text(L"信息："), 390, 145, 90, 20));
             g_hComboBatteryTouchbarMode = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
                 480, 142, 230, 210, hwnd, (HMENU)IDC_COMBO_BAT_TOUCHBAR_MODE, NULL, NULL);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hComboBatteryTouchbarMode);
-            g_hBatteryTouchbarDirectionLabel = mk_label(hwnd, L"方向：", 390, 190, 90, 20);
+            g_hBatteryTouchbarDirectionLabel = mk_label(hwnd, ui_text(L"方向："), 390, 190, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hBatteryTouchbarDirectionLabel);
             g_hComboBatteryTouchbarDirection = CreateWindow(L"COMBOBOX", L"",
                 WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST,
                 480, 187, 230, 150, hwnd, (HMENU)IDC_COMBO_BAT_TOUCHBAR_DIRECTION, NULL, NULL);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hComboBatteryTouchbarDirection);
-            g_hBatteryTouchbarMetricLabel = mk_label(hwnd, L"指标颜色：", 390, 235, 90, 20);
+            g_hBatteryTouchbarMetricLabel = mk_label(hwnd, ui_text(L"指标颜色："), 390, 235, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hBatteryTouchbarMetricLabel);
-            g_batteryTouchbarColorBtnStart = mk_button(hwnd, L"颜色 A", IDC_BAT_TOUCHBAR_COLOR_START, 480, 230, 108, 30);
-            g_batteryTouchbarColorBtnEnd = mk_button(hwnd, L"颜色 B", IDC_BAT_TOUCHBAR_COLOR_END, 602, 230, 108, 30);
+            g_batteryTouchbarColorBtnStart = mk_button(hwnd, ui_text(L"颜色 A"), IDC_BAT_TOUCHBAR_COLOR_START, 480, 230, 108, 30);
+            g_batteryTouchbarColorBtnEnd = mk_button(hwnd, ui_text(L"颜色 B"), IDC_BAT_TOUCHBAR_COLOR_END, 602, 230, 108, 30);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_batteryTouchbarColorBtnStart);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_batteryTouchbarColorBtnEnd);
-            g_hBatteryTouchbarAudioLabel = mk_label(hwnd, L"音频 RGB：", 390, 280, 90, 20);
+            g_hBatteryTouchbarAudioLabel = mk_label(hwnd, ui_text(L"音频 RGB："), 390, 280, 90, 20);
             add_page_control(g_pageTouchbar, &g_pageTouchbarCount, g_hBatteryTouchbarAudioLabel);
             for (int i = 0; i < 3; i++) {
                 g_batteryTouchbarAudioColorBtn[i] = mk_button(hwnd, (const wchar_t *[]){L"RGB 1",L"RGB 2",L"RGB 3"}[i],
@@ -5404,7 +5429,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (GetDlgCtrlID(ctrl) == IDC_SLIDER_ANGLE) {
                 g_waveAngle = (LONG)SendMessage(ctrl, TBM_GETPOS, 0, 0);
                 wchar_t buf[64];
-                wsprintf(buf, L"角度：%d 度", (int)g_waveAngle);
+                wsprintf(buf, ui_text(L"角度：%d 度"), (int)g_waveAngle);
                 SetWindowText(g_hLblAngle, buf);
             }
             else if (GetDlgCtrlID(ctrl) == IDC_SLIDER_WSPEED) g_waveSpeed = (LONG)SendMessage(ctrl, TBM_GETPOS, 0, 0);
@@ -5417,7 +5442,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else if (GetDlgCtrlID(ctrl) == IDC_SLIDER_LTCONCUR) {
                 g_lightningConcurrent = (LONG)SendMessage(ctrl, TBM_GETPOS, 0, 0);
                 wchar_t buf[64];
-                wsprintf(buf, L"同时出现数量：%d", (int)g_lightningConcurrent);
+                wsprintf(buf, ui_text(L"同时出现数量：%d"), (int)g_lightningConcurrent);
                 SetWindowText(g_hLblConcurrent, buf);
             }
             else if (GetDlgCtrlID(ctrl) == IDC_SLIDER_FLSPEED) g_flameSpeed = (LONG)SendMessage(ctrl, TBM_GETPOS, 0, 0);
@@ -5437,6 +5462,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_COMMAND:
+            if (LOWORD(wp) == IDC_COMBO_LANGUAGE && HIWORD(wp) == CBN_SELCHANGE) {
+                ui_language_set((int)SendMessageW((HWND)lp, CB_GETCURSEL, 0, 0));
+                refresh_ui_language(hwnd);
+                save_config();
+                return 0;
+            }
             if (LOWORD(wp) >= IDC_PAGE_EFFECTS && LOWORD(wp) <= IDC_PAGE_PROGRAM) {
                 show_ui_page(LOWORD(wp) - IDC_PAGE_EFFECTS);
                 return 0;
@@ -5664,7 +5695,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     stop_current_effect();
                     capture_current_power_profile();
                     update_power_profile_ui();
-                    set_status(L"当前模式：无");
+                    set_status(ui_text(L"当前模式：无"));
                     show_panel_for_mode(-1);
                     SendMessage(g_hComboMode, CB_SETCURSEL, (WPARAM)-1, 0);
                     save_config();
@@ -5757,9 +5788,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (lp == WM_RBUTTONUP) {
                 POINT pt; GetCursorPos(&pt);
                 HMENU menu = CreatePopupMenu();
-                AppendMenu(menu, MF_STRING, IDC_TRAY_RESTORE, L"打开控制面板");
+                AppendMenu(menu, MF_STRING, IDC_TRAY_RESTORE, ui_text(L"打开控制面板"));
                 AppendMenu(menu, MF_SEPARATOR, 0, NULL);
-                AppendMenu(menu, MF_STRING, IDC_TRAY_EXIT, L"退出");
+                AppendMenu(menu, MF_STRING, IDC_TRAY_EXIT, ui_text(L"退出"));
                 SetForegroundWindow(hwnd);
                 TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
                 DestroyMenu(menu);
@@ -5819,6 +5850,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     srand((unsigned int)time(NULL));
 
     LPWSTR cl = GetCommandLineW();
+    ui_language_init();
+    InterlockedExchange(&g_onAcPower, query_ac_power());
+    load_config();
     if (wcsstr(cl, L"--install-autostart")) {
         autostart_apply(1);
         return 0;
@@ -5828,8 +5862,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         return 0;
     }
     g_startupLaunch = (wcsstr(cl, L"--startup") != NULL);
-    InterlockedExchange(&g_onAcPower, query_ac_power());
-    load_config();
     int relockMode = 0;
     DWORD relockParentPid = 0;
     DWORD elevatedParentPid = 0;
@@ -5890,26 +5922,26 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     if (!resolve_device_path()) {
         if (relockMode) restart_vendor_service_if_found();
         MessageBoxW(NULL,
-            L"未找到兼容的键盘控制器。\n"
+            ui_text(L"未找到兼容的键盘控制器。\n"
             L"本程序仅支持带单键 RGB 接口的 ITE8291 键盘（USB 厂商 ID：048D）。\n"
-            L"检测详情已写入程序目录中的 rgb_engine_log.txt。",
-            L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+            L"检测详情已写入程序目录中的 rgb_engine_log.txt。"),
+            ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
         return 1;
     }
     g_h = hid_open_path(g_devicePath);
     if (!g_h) {
         if (relockMode) restart_vendor_service_if_found();
         MessageBoxW(NULL,
-            L"已找到键盘 RGB 接口，但无法打开。\n"
-            L"其他程序可能正在独占该接口，请查看程序目录中的 rgb_engine_log.txt。",
-            L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+            ui_text(L"已找到键盘 RGB 接口，但无法打开。\n"
+            L"其他程序可能正在独占该接口，请查看程序目录中的 rgb_engine_log.txt。"),
+            ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
         return 1;
     }
     if (enter_custom_mode() < 0) {
         if (relockMode) restart_vendor_service_if_found();
         MessageBoxW(NULL,
-            L"无法进入单键 RGB 控制模式。",
-            L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+            ui_text(L"无法进入单键 RGB 控制模式。"),
+            ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
         hid_close(g_h); hid_exit();
         return 1;
     }
@@ -5935,8 +5967,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
         restart_vendor_service_if_found();
         if (!g_h) {
             MessageBoxW(NULL,
-                L"尝试重新取得独占控制后，无法再次打开键盘设备。",
-                L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+                ui_text(L"尝试重新取得独占控制后，无法再次打开键盘设备。"),
+                ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
             hid_exit();
             DeleteCriticalSection(&g_deviceLock);
             return 1;
@@ -5945,9 +5977,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
             sprintf(lb, "relock: still SHARED after %d retries, refusing to start in shared mode", attempt);
             log_event(lb);
             MessageBoxW(NULL,
-                L"无法取得设备独占权：官方服务仍占用键盘 RGB 接口。\n"
-                L"为避免冲突，程序不会以共享模式启动。请稍后重试。",
-                L"Better RGB - 设备占用", MB_OK|MB_ICONERROR);
+                ui_text(L"无法取得设备独占权：官方服务仍占用键盘 RGB 接口。\n"
+                L"为避免冲突，程序不会以共享模式启动。请稍后重试。"),
+                ui_text(L"Better RGB - 设备占用"), MB_OK|MB_ICONERROR);
             hid_close(g_h);
             hid_exit();
             DeleteCriticalSection(&g_deviceLock);
@@ -5961,19 +5993,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
                 return 0;
             }
             MessageBoxW(NULL,
-                L"无法停止官方灯光服务或重新取得 RGB 接口独占权。\n"
-                L"为保护键盘 EC，程序不会以共享模式运行，请关闭控制中心后重试。",
-                L"Better RGB - 无法取得独占控制", MB_OK|MB_ICONERROR);
+                ui_text(L"无法停止官方灯光服务或重新取得 RGB 接口独占权。\n"
+                L"为保护键盘 EC，程序不会以共享模式运行，请关闭控制中心后重试。"),
+                ui_text(L"Better RGB - 无法取得独占控制"), MB_OK|MB_ICONERROR);
             hid_close(g_h);
             hid_exit();
             DeleteCriticalSection(&g_deviceLock);
             return 1;
         } else {
             int ans = MessageBoxW(NULL,
-                L"官方服务（GCUBridge / 控制中心）正在占用键盘 RGB 接口，可能随时覆盖本程序的灯效。\n\n"
+                ui_text(L"官方服务（GCUBridge / 控制中心）正在占用键盘 RGB 接口，可能随时覆盖本程序的灯效。\n\n"
                 L"是否立即处理？程序会短暂重启官方服务并重新启动，以取得 RGB 接口独占权。风扇、性能和电源功能不受影响，Windows 会请求管理员权限。\n\n"
-                L"选择“否”将安全退出，本版本不允许共享模式。",
-                L"Better RGB - 需要独占 RGB 接口", MB_YESNO|MB_ICONWARNING);
+                L"选择“否”将安全退出，本版本不允许共享模式。"),
+                ui_text(L"Better RGB - 需要独占 RGB 接口"), MB_YESNO|MB_ICONWARNING);
             if (ans == IDYES) {
                 wchar_t relaunchArgs[64];
                 _snwprintf(relaunchArgs, 63, L"--elevated-relock %lu", (unsigned long)GetCurrentProcessId());
@@ -5986,9 +6018,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
                 }
                 log_event("elevation cancelled or failed, exiting without the lock");
                 MessageBoxW(NULL,
-                    L"未获得管理员权限，无法安全取得 RGB 接口独占权。\n"
-                    L"程序即将关闭。请重新启动并允许管理员权限请求。",
-                    L"Better RGB - 权限不足", MB_OK|MB_ICONERROR);
+                    ui_text(L"未获得管理员权限，无法安全取得 RGB 接口独占权。\n"
+                    L"程序即将关闭。请重新启动并允许管理员权限请求。"),
+                    ui_text(L"Better RGB - 权限不足"), MB_OK|MB_ICONERROR);
                 hid_close(g_h);
                 hid_exit();
                 DeleteCriticalSection(&g_deviceLock);
@@ -6030,17 +6062,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
     if (!RegisterClass(&wc)) {
-        MessageBox(NULL, L"窗口类注册失败。", L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+        MessageBox(NULL, ui_text(L"窗口类注册失败。"), ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
         hid_close(g_h); hid_exit();
         return 1;
     }
 
-    HWND hwnd = CreateWindow(wc.lpszClassName, L"同模具 ITE8291 - Better RGB 中文增强版 3.6.1",
+    HWND hwnd = CreateWindow(wc.lpszClassName, ui_text(L"同模具 ITE8291 - Better RGB 中文增强版 3.7.0"),
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 540,
         NULL, NULL, hInst, NULL);
     if (!hwnd) {
-        MessageBox(NULL, L"主窗口创建失败。", L"Better RGB - 错误", MB_OK|MB_ICONERROR);
+        MessageBox(NULL, ui_text(L"主窗口创建失败。"), ui_text(L"Better RGB - 错误"), MB_OK|MB_ICONERROR);
         hid_close(g_h); hid_exit();
         return 1;
     }

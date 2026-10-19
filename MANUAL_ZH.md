@@ -76,4 +76,10 @@
 
 ## 开源说明
 
-本版本基于 EpicYamo 的 `Better-RGB-for-Tongfang_ITE8291` 修改，依据 MIT License 分发。触碰涟漪参考了 QMK 与 OpenRGB Effects 中常见的按键扩散交互形式，具体实现为本项目独立编写，没有复制不兼容许可证的源代码。
+本版本基于 TheYamo（EpicYamo）的 [Better RGB for Tongfang/ITE8291](https://github.com/EpicYamo/Better-RGB-for-Tongfang-ITE8291) 修改，依据 MIT License 分发。[旧仓库](https://github.com/EpicYamo/Better_RGB_Old-Repo)已归档，新开发在上述新仓库进行。触碰涟漪参考了 QMK 与 OpenRGB Effects 中常见的按键扩散交互形式，具体实现为本项目独立编写，没有复制不兼容许可证的源代码。
+
+## 界面语言（3.7.0）
+
+进入“程序设置 / Settings”，在右上角“Language / 语言”选择“简体中文”或“English”，立即生效，无需重启。灯效、插电/电池方案、Bar 和校准参数保持原值。选择保存到 `better_rgb.cfg` 的 `uiLanguage`（0=中文，1=英文）。旧配置没有这个字段时按 Windows 界面语言初始化：中文系统选择中文，其他系统选择英文。Windows 原生颜色选择器和系统权限提示可能仍使用 Windows 的显示语言。
+
+英文入门说明见 [README_EN.md](README_EN.md)。

@@ -33,19 +33,23 @@ $hidRoot = Join-Path $packageRoot "third_party\hidapi"
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
 $resourceObject = Join-Path $OutputDirectory "resource.o"
-$applicationObject = Join-Path $OutputDirectory "better_rgb.o"
+$applicationObjects = @()
 $hidObject = Join-Path $OutputDirectory "hid.o"
-$executable = Join-Path $OutputDirectory "Better RGB Adaptive v3.6.1.exe"
+$executable = Join-Path $OutputDirectory "Better RGB Adaptive v3.7.0.exe"
 
 Invoke-Checked $windres @(
     (Join-Path $source "resource.rc"), "-O", "coff", "-o", $resourceObject
 )
 
 # Treat every warning in first-party code as a release build failure.
-Invoke-Checked $clang @(
-    "-std=c11", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
-    "-I", $source, "-c", (Join-Path $source "better_rgb.c"), "-o", $applicationObject
-)
+foreach ($module in @('better_rgb', 'i18n', 'color_math')) {
+    $object = Join-Path $OutputDirectory "$module.o"
+    Invoke-Checked $clang @(
+        "-std=c11", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
+        "-I", $source, "-c", (Join-Path $source "$module.c"), "-o", $object
+    )
+    $applicationObjects += $object
+}
 
 # hidapi 0.16.0 emits three upstream strict-prototype warnings; do not use -Werror here.
 Invoke-Checked $clang @(
@@ -54,12 +58,12 @@ Invoke-Checked $clang @(
     "-c", (Join-Path $hidRoot "windows\hid.c"), "-o", $hidObject
 )
 
-Invoke-Checked $clang @(
-    $applicationObject, $resourceObject, $hidObject, "-o", $executable, "-mwindows",
+Invoke-Checked $clang ($applicationObjects + @(
+    $resourceObject, $hidObject, "-o", $executable, "-mwindows",
     "-lsetupapi", "-lhid", "-lm", "-lcomdlg32", "-lcomctl32", "-lshell32",
     "-ladvapi32", "-lole32", "-loleaut32", "-lwbemuuid", "-lpdh",
     "-lgdi32", "-luser32", "-lkernel32"
-)
+))
 
 $file = Get-Item -LiteralPath $executable
 $hash = Get-FileHash -LiteralPath $executable -Algorithm SHA256

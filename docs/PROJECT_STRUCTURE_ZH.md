@@ -1,6 +1,13 @@
 # 项目结构
 
-核心实现集中在 `source/better_rgb.c`，这是一个 Win32 C 单文件应用：
+3.7.0 开始渐进模块化，各模块独立编译并链接：
+
+- `source/i18n.c` / `i18n.h`：默认语言、语言选择和双向文本查找。
+- `source/ui_strings.def`：中文/英文翻译目录，格式占位符由测试检查。
+- `source/color_math.c` / `color_math.h`：sRGB/线性光转换及三通道白色校准。
+- `tests/ui_smoke.c` / `tests/run.ps1`：不连接 HID 的界面与配置回归、颜色计算和翻译覆盖检查。
+
+其余协调逻辑仍集中在 `source/better_rgb.c`，后续可逐步拆出设备、配置和灯效：
 
 - 全局状态与配置：灯效参数、插电/电池配置、过渡、休眠和 Touch Bar 指标。
 - HID 设备层：枚举 ITE 设备、选择 RGB 接口、独占打开、重连及发送帧。
