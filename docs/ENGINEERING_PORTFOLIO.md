@@ -30,4 +30,6 @@ The projects below started with everyday questions about a laptop, a math class,
 
 **Evidence and limits.** The algorithm notes document the reuse checks, test commands, and fallback behavior. This project uses an existing engine; the scheduling changes are not evidence of stronger play.
 
-[Source and setup](https://github.com/ZavierChen/bulldog-xiangqi) · [Algorithm notes](https://github.com/ZavierChen/bulldog-xiangqi/blob/main/docs/ALGORITHMS.md)
+**From engineering to research.** An apparent sacrifice that briefly recovered under deeper search showed why a shallow evaluation is not a stopping rule. Background analysis raised a second question: which possible reply is worth computing before the opponent moves? The theory-first proposal studies that question under a fixed budget, with a small model showing how a check can matter because it determines whether a second check is worthwhile. The proposed evaluation separates response time, total computation, and move quality.
+
+[Research proposal](https://github.com/ZavierChen/bulldog-xiangqi/blob/main/docs/RESEARCH_PROPOSAL.md) · [Source and setup](https://github.com/ZavierChen/bulldog-xiangqi) · [Algorithm notes](https://github.com/ZavierChen/bulldog-xiangqi/blob/main/docs/ALGORITHMS.md)
