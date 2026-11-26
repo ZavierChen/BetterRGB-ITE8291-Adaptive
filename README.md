@@ -1,6 +1,6 @@
 # BetterRGB ITE8291 Adaptive
 
-[English](README_EN.md) | 简体中文
+[English](README_EN.md) | 简体中文 | [Engineering Project Portfolio](docs/ENGINEERING_PORTFOLIO.md)
 
 面向同模具游戏本的独立 Windows RGB 键盘控制器，适用于采用兼容 ITE8291 HID 接口的单键 RGB 键盘。
 
