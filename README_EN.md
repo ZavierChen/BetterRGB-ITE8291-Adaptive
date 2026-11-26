@@ -1,6 +1,6 @@
 # BetterRGB ITE8291 Adaptive
 
-English | [简体中文](README.md)
+English | [简体中文](README.md) | [Engineering Project Portfolio](docs/ENGINEERING_PORTFOLIO.md)
 
 A native Windows controller for compatible Tongfang-style laptops with ITE8291 per-key RGB keyboards. It streams lighting frames through the user-mode HID interface, without flashing BIOS, EC or keyboard firmware.
 
